@@ -750,6 +750,16 @@
               (else (loop (cdr ps)))))))
 (define (image-refusal-for x)
   (and (jhost? x) (hashtable-ref image-refusal-by-tag (jhost-tag x) #f)))
+;; A layout an older image may hold that this process cannot take: CHECK sees
+;; the value as read, before anything is rebuilt from it, and answers why it
+;; cannot be read (the image read then fails naming it) or #f.
+(define image-read-check-by-tag (make-hashtable string-hash string=?))
+(define (register-image-read-check! tags check)
+  (for-each (lambda (t) (hashtable-set! image-read-check-by-tag t check)) tags))
+(define (image-read-refusal x)
+  (and (jhost? x)
+       (let ((c (hashtable-ref image-read-check-by-tag (jhost-tag x) #f)))
+         (and c (c x)))))
 
 ;; ---- host object ------------------------------------------------------------
 (define-record-type jhost (fields tag (mutable state)) (nongenerative chez-jhost-v1))

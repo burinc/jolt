@@ -144,22 +144,64 @@
     (unless (fx=? end (dq-tail self)) (throw-jvm 'ConcurrentModificationException jolt-nil))
     jolt-nil))
 
-;; removeIf / removeAll / retainAll: test each element once, in order, then
-;; compact the survivors over the same buffer; a tail that moved meanwhile is a
-;; CME (and nothing is removed)
+;; removeIf / removeAll / retainAll: the JDK's bulkRemove. A first pass tests
+;; up to the tail read at the start; nothing matching and a tail that moved is
+;; a CME. At the first match bulkRemoveModified takes over: it reads the buffer
+;; and the tail AGAIN, so an element the predicate added before then is tested
+;; too, marks the rest, compacts the survivors over the buffer, and only then
+;; checks the tail (a CME leaves the buffer half compacted, as the JDK's does).
+;; Its death row is sized by the distance from the first match to that tail; an
+;; empty one (the add grew the buffer and the tail wrapped onto the match) is the
+;; JDK's ArrayIndexOutOfBoundsException.
 (define (dq-bulk-remove! self test)
-  (let* ((es (dq-es self)) (n (vector-length es)) (h (dq-head self)) (end (dq-tail self))
-         (dead (make-eqv-hashtable)) (any #f))
-    (dq-each-index es h end
-      (lambda (i) (when (jolt-truthy? (test (vector-ref es i))) (hashtable-set! dead i #t) (set! any #t))))
-    (unless (fx=? end (dq-tail self)) (throw-jvm 'ConcurrentModificationException jolt-nil))
-    (and any
-         (let ((w h))
-           (dq-each-index es h end
-             (lambda (i) (unless (hashtable-ref dead i #f) (vector-set! es w (vector-ref es i)) (set! w (dq-inc w n)))))
-           (dq-each-index es w end (lambda (i) (vector-set! es i jolt-nil)))
-           (dq-tail! self w)
-           #t))))
+  (let* ((es (dq-es self)) (end (dq-tail self)) (h (dq-head self)))
+    (let loop ((i h) (to (if (fx<=? h end) end (vector-length es))))
+      (cond ((fx<? i to)
+             (if (jolt-truthy? (test (vector-ref es i)))
+                 (dq-bulk-remove-modified! self test i)
+                 (loop (fx+ i 1) to)))
+            ((fx=? to end)
+             (unless (fx=? end (dq-tail self)) (throw-jvm 'ConcurrentModificationException jolt-nil))
+             #f)
+            (else (loop 0 end))))))
+(define (dq-bulk-remove-modified! self test beg)
+  (let* ((es (dq-es self)) (cap (vector-length es)) (end (dq-tail self))
+         (len (dq-sub end beg cap))
+         (dead (make-vector len #f)))
+    (when (fx=? len 0)
+      (throw-jvm 'ArrayIndexOutOfBoundsException "Index 0 out of bounds for length 0"))
+    (vector-set! dead 0 #t)
+    ;; mark: i walks the legs, k makes i - k the distance from beg
+    (let mark ((i (fx+ beg 1)) (to (if (fx<=? (fx+ beg 1) end) end cap)) (k beg))
+      (let run ((i i))
+        (if (fx<? i to)
+            (begin (when (jolt-truthy? (test (vector-ref es i))) (vector-set! dead (fx- i k) #t))
+                   (run (fx+ i 1)))
+            (unless (fx=? to end) (mark 0 end (fx- k cap))))))
+    ;; compact: hare i reads, tortoise w writes
+    (let ((w beg) (i (fx+ beg 1)) (to (if (fx<=? (fx+ beg 1) end) end cap)) (k beg))
+      (define (clear? i) (not (vector-ref dead (fx- i k))))
+      (let outer ()
+        (let same-leg () ; i and w on one leg
+          (when (fx<? i to)
+            (when (clear? i) (vector-set! es w (vector-ref es i)) (set! w (fx+ w 1)))
+            (set! i (fx+ i 1))
+            (same-leg)))
+        (unless (fx=? to end)
+          ;; w on the first leg, i on the second
+          (set! i 0) (set! to end) (set! k (fx- k cap))
+          (let cross ()
+            (when (and (fx<? i to) (fx<? w cap))
+              (when (clear? i) (vector-set! es w (vector-ref es i)) (set! w (fx+ w 1)))
+              (set! i (fx+ i 1))
+              (cross)))
+          (if (fx>=? i to)
+              (when (fx=? w cap) (set! w 0))
+              (begin (set! w 0) (outer)))))
+      (unless (fx=? end (dq-tail self)) (throw-jvm 'ConcurrentModificationException jolt-nil))
+      (dq-tail! self w)
+      (dq-each-index es w end (lambda (i) (vector-set! es i jolt-nil)))
+      #t)))
 (define (dq-clear! self)
   (let ((es (dq-es self))) (dq-each-index es (dq-head self) (dq-tail self) (lambda (i) (vector-set! es i jolt-nil))))
   (dq-head! self 0) (dq-tail! self 0)
@@ -171,13 +213,27 @@
     (for-each (lambda (x) (dq-add-last! self x)) xs)
     (fx>? (dq-size self) s)))
 
+;; The list layout took a nil ((.add d nil) was accepted before the ring), but
+;; the ring marks an empty slot with nil, so a deque holding one cannot become a
+;; ring: reading it from an image is refused rather than losing the element.
+(register-image-read-check! '("arraydeque")
+  (lambda (d)
+    (let ((st (jhost-state d)))
+      (and (fx=? (vector-length st) 3)
+           (let ((v (vector-ref st 0)) (n (vector-ref st 1)) (h (vector-ref st 2)))
+             (let loop ((i 0))
+               (cond ((fx=? i n) #f)
+                     ((jolt-nil? (vector-ref v (fx+ h i)))
+                      "it holds nil, which an ArrayDeque cannot (an image written before format 14 let one in)")
+                     (else (loop (fx+ i 1))))))))))
+
 ;; ---- iterators ---------------------------------------------------------------
 ;; State #(deque cursor remaining lastRet descending?). remaining is fixed when
 ;; the iterator is made: an element added later is not handed out, and a slot
 ;; found empty is a CME.
 (define (make-dq-iterator self desc?)
   (let ((es (dq-es self)))
-    (make-jhost (if desc? "arraydeque-desc-iterator" "arraydeque-iterator")
+    (make-jhost (if desc? "jx-arraydeque-desc-iterator" "jx-arraydeque-iterator")
                 (vector self (if desc? (dq-dec (dq-tail self) (vector-length es)) (dq-head self))
                         (dq-size self) -1 desc?))))
 (define (dqi-ref it i) (vector-ref (jhost-state it) i))
@@ -241,9 +297,9 @@
                                 (if (fx<=? r 0) (reverse acc)
                                     (loop (if (dqi-ref it 4) (dq-dec c n) (dq-inc c n)) (fx- r 1) (cons (vector-ref es c) acc))))))
                           #f #f #f))
-          '(("arraydeque-iterator" "java.util.ArrayDeque$DeqIterator")
-            ("arraydeque-desc-iterator" "java.util.ArrayDeque$DescendingIterator")))
-(register-image-refusal! '("arraydeque-iterator" "arraydeque-desc-iterator")
+          '(("jx-arraydeque-iterator" "java.util.ArrayDeque$DeqIterator")
+            ("jx-arraydeque-desc-iterator" "java.util.ArrayDeque$DescendingIterator")))
+(register-image-refusal! '("jx-arraydeque-iterator" "jx-arraydeque-desc-iterator")
                          "an iterator is a position in a walk this process is making; write the collection instead")
 
 ;; ---- the spliterator -----------------------------------------------------------

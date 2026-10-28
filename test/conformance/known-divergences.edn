@@ -1694,7 +1694,7 @@
    :check {:expr "(let [l (java.util.ArrayList. [1 2]) it (.iterator l)] (.next it) (.ensureCapacity l 5) (try (.next it) :ok (catch java.util.ConcurrentModificationException _ :cme)))"
            :jvm ":cme"
            :jolt ":ok"}
-   :note "jolt does not keep the JDK's capacity, which nothing else observes; trimToSize, which always counts one, matches. The fail-fast rows in the corpus pin the rest."}
+   :note "jolt does not keep the JDK's capacity, which nothing else observes. The capacity calls that count a change without looking at it match: ArrayList.trimToSize, Vector.trimToSize, and Vector.ensureCapacity with a positive request. The fail-fast rows in the corpus pin them and the rest."}
   {:category :host-model
    :behavior "the order a WeakHashMap walks its keys"
    :jvm "its table's buckets, last to first, by the spread hashCode and the capacity it has grown to"

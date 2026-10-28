@@ -130,7 +130,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   jolt does not model (`java.util.TimerTask`) extends it, and `isInterface`
   answers for those types.
 - **Images are format 14**: an `ArrayDeque` travels as its ring buffer and a
-  list carries its modCount; older images still read.
+  list carries its modCount; older images still read, except an old
+  `ArrayDeque` holding nil, which is refused by name.
+- **`iterator-seq` is lazy, as `RT.chunkIteratorSeq` is**: it asks `hasNext`
+  when made and pulls 32 elements at a time through `next`, so a list changed
+  before the seq is walked throws `ConcurrentModificationException`, and any
+  iterator with `hasNext`/`next` works.
 - **A HashMap's `keySet`, `values` and `entrySet` are live views**
   (`HashMap$KeySet` / `$Values` / `$EntrySet`): removing through one removes
   from the map, a later put shows through, an entry's `setValue` writes the map
@@ -184,6 +189,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The per-thread string hash cache held up to 2048 strings strongly; it is
   weak now.
 - `Vector.addAll` handed the list code a raw list and threw.
+- `iterator-seq` over an `ArrayDeque`'s iterators threw.
+- `ArrayDeque.removeIf` / `removeAll` / `retainAll` threw
+  `ConcurrentModificationException` when the predicate added an element before
+  the first match; they re-read the tail there, as the JDK's do.
+- `Vector.trimToSize` and `Vector.ensureCapacity` count a structural change.
+- `load-file` returned nil; it answers the value of the file's last form.
 - `jch-register-supers!` left the derived name tables stale; a new reify or
   proxy class no longer flushes the class graph's dispatch caches.
 - `get` on a reify calls the 1-arity `valAt` for `(get r k)` and reads a

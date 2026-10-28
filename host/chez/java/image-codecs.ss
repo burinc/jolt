@@ -210,7 +210,7 @@
     "treemap-entry")
   "it is a view of another collection, which the image would have to share; write the collection itself")
 (register-image-refusal!
-  '("arraylist-iterator" "arraylist-listitr" "linkedlist-iterator" "linkedlist-desc-iterator" "arraydeque-iterator" "arrays-aslist-iterator"
+  '("arraylist-iterator" "arraylist-listitr" "linkedlist-iterator" "linkedlist-desc-iterator" "arrays-aslist-iterator"
     "immutable-list-iterator" "hashset-iterator" "lhs-iterator" "lhm-keyset-iterator" "lhm-values-iterator" "lhm-entryset-iterator"
     "enum-set-regular-iterator" "enum-set-jumbo-iterator" "enum-map-keyset-iterator"
     "enum-map-values-iterator" "enum-map-entryset-iterator"

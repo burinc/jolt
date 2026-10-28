@@ -2433,6 +2433,40 @@
 
 (register-seq-arm! jiterator? jiterator-cur)
 
+(define (iterator-seq-method it name)
+  (or (and (jhost? it) (host-method-ref (jhost-tag it) name))
+      (lambda (self)
+        (record-method-dispatch self name (jolt-vector)))))
+
+(define (jolt-iterator-seq it)
+  (if (jiterator? it)
+      (jolt-seq (jiterator-cur it))
+      (let ((has-next? (iterator-seq-method it "hasNext"))
+            (next (iterator-seq-method it "next")))
+        (let chunks ()
+          (if (jolt-truthy? (has-next? it))
+              (jolt-make-lazy-seq
+                (lambda ()
+                  (let ((buf (make-vector 32)))
+                    (let fill ((n 0))
+                      (if (and (jolt-truthy? (has-next? it)) (fx<? n 32))
+                          (begin
+                            (vector-set! buf n (next it))
+                            (fill (fx+ n 1)))
+                          (let ((more (chunks)))
+                            (if (fx=? n 0)
+                                more
+                                (cseq-chunked
+                                  (make-pvec
+                                    (if (fx=? n 32)
+                                        buf
+                                        (sa-subvector buf 0 n)))
+                                  0
+                                  more))))))))
+              jolt-nil)))))
+
+(def-var! "clojure.core" "iterator-seq" jolt-iterator-seq)
+
 (define (condition->message-string c)
   (if (message-condition? c)
       (let* ((m (condition-message c))

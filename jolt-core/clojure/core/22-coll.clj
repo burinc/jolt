@@ -349,7 +349,7 @@
     (seq e)
     (lazy-seq (when (.hasMoreElements e)
                 (cons (.nextElement e) (enumeration-seq e))))))
-(defn iterator-seq [i] (seq i))
+;; iterator-seq is the host's (records-dispatch.ss): RT.chunkIteratorSeq.
 
 ;; jolt is single-threaded: a promise is an atom, deref never blocks
 ;; ((deref undelivered) is nil rather than a hang).

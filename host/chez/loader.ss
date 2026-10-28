@@ -736,10 +736,13 @@
               ;; and the run exited 0. A test file that lost its whole body that
               ;; way still looked like a pass. The JVM raises "Unmatched
               ;; delimiter: )" here (jolt-3amm).
-              (let loop ((i 0) (ord 0))
-                (when (< i end)
+              ;; the value of the last form is the load's, as Compiler.load's is
+              (let loop ((i 0) (ord 0) (last jolt-nil))
+                (if (>= i end)
+                    last
                   (let-values (((form j) (rdr-read-top src i end)))
-                    (when (> j i)
+                    (if (<= j i)
+                        last
                       ;; ord counts every top-level form read (the ns form
                       ;; included): it is the def-ordinal clock for the build's
                       ;; visibility replay — rt.ss var-def-ordinals, stamped via
@@ -756,8 +759,8 @@
                       ;; stamps at its call form's ordinal), then bumped. One
                       ;; tail call: an eof placeholder read consumes no ordinal.
                       (if (rdr-eof? form)
-                          (loop j ord)
-                          (begin
+                          (loop j ord last)
+                          (let ((v (begin
                             (when (getenv "JOLT_TRACE_LOAD")
                               (display "  [load-form] " (current-error-port))
                               (display (jolt-pr-str form) (current-error-port)) (newline (current-error-port)))
@@ -765,8 +768,8 @@
                                              (cons (make-load-frame path ord (chez-current-ns))
                                                    (jolt-load-frames))))
                               (jolt-compile-eval-form (if data-readers-active (ldr-apply-readers form) form)
-                                                      (chez-current-ns)))
-                            (loop j (fx+ ord 1)))))))))))))))
+                                                      (chez-current-ns))))))
+                            (loop j (fx+ ord 1) v))))))))))))))
 
 ;; --- AOT / compile cache for required namespaces ----------------------------
 ;; A disk-backed namespace is recompiled from source on EVERY run (load-jolt-file
@@ -3008,8 +3011,7 @@
 ;; the file's name too (ldr-source-name).
 (define (jolt-load-file path)
   (parameterize ((ldr-file-load-path path))
-    (load-jolt-file/restoring-ns path))
-  jolt-nil)
+    (load-jolt-file/restoring-ns path)))
 
 ;; expand-spec: the shared prefix-list expansion (expand-libspec, ns.ss) —
 ;; kept under its old name for the build driver's callers.

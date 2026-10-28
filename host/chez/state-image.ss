@@ -1102,7 +1102,15 @@
              (walk
               (lambda (x path)
                 (if restore?
-                    (let ((r (walk-body x path)))
+                    (let ((r (begin
+                               (let ((why (image-read-refusal x)))
+                                 (when why
+                                   (jolt-throw
+                                     (jolt-ex-info
+                                       (string-append "image: cannot read a " (jolt-class-name x) " at "
+                                                      (image-path->string path) ": " why)
+                                       empty-pmap))))
+                               (walk-body x path))))
                       (when (jolt-identity-hashed? r) (set! proc-touched #t))
                       r)
                     (walk-body x path))))
@@ -2297,7 +2305,9 @@
 ;; #(backing count head), and an ArrayList / LinkedList carries its modCount as a
 ;; fourth slot. Both older layouts still read (java/array-deque.ss converts an
 ;; old deque on first use; host-static-classes.ss reads a 3-slot list as count
-;; 0); a jolt that knows only 13 refuses a 14 rather than misread a deque.
+;; 0); a jolt that knows only 13 refuses a 14 rather than misread a deque. An
+;; old deque holding nil, which the list layout allowed and the ring cannot
+;; hold, is refused on read (image-read-refusal, from array-deque.ss).
 ;;
 ;; Format 13 names the defrecord and deftype types an image holds instances of.
 ;; An instance travels with its descriptor, but whether its type was a record —

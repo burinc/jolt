@@ -1422,6 +1422,14 @@
 (is "format 14: an old-layout ArrayDeque and ArrayList read and work"
     (string-append "(let [[d l] (jolt.host/image-read \"" tmp "\")] [(vec d) (.pollFirst d) (do (.addFirst d 0) (.addLast d 9) (vec d)) (count d) (vec l) (let [it (.iterator l)] (.next it) (.add l 9) (try (.next it) :no-cme (catch java.util.ConcurrentModificationException _ :cme))) (vec l)])")
     "[[1 2 3] 1 [0 2 3 9] 4 [7 8] :cme [7 8 9]]")
+;; The list layout let a nil in ((.add d nil) was accepted); the ring buffer
+;; marks an empty slot with nil, so such a deque cannot become one. Reading it
+;; is refused by name rather than turning the nil into a hole.
+(def-var! "user" "legacy-dq-nil" (make-jhost "arraydeque" (vector (vector 1 jolt-nil 2) 3 0)))
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" [legacy-dq-nil])"))
+(is "format 14: an old-layout ArrayDeque holding nil is refused on read"
+    (string-append "(try (jolt.host/image-read \"" tmp "\") :read (catch Exception e (ex-message e)))")
+    "\"image: cannot read a java.util.ArrayDeque at [0]: it holds nil, which an ArrayDeque cannot (an image written before format 14 let one in)\"")
 
 ;; --- the same proof for the COLLECTION records and their metadata. Format 7
 ;; carried a vector/map/set/list/lazy-seq/() as the slotless records

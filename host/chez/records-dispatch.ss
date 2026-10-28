@@ -17,6 +17,36 @@
 ;; cur, so seq just yields it — clojure.test's (iterator-seq (.iterator coll)).
 (register-seq-arm! jiterator? jiterator-cur)
 
+;; iterator-seq is RT.chunkIteratorSeq: hasNext is asked when the seq is made,
+;; and each realization pulls up to 32 through next() — hasNext before the
+;; count, as the JDK loop reads them — then asks hasNext again for the rest. So
+;; a fail-fast iterator throws when the seq is walked after a change, not when
+;; it is made. A jhost iterator's two methods are looked up once per seq; any
+;; other goes through the dispatcher. A SeqIterator walks an immutable seq, so
+;; it hands that seq over as it stands: the same elements, no copy.
+(define (iterator-seq-method it name)
+  (or (and (jhost? it) (host-method-ref (jhost-tag it) name))
+      (lambda (self) (record-method-dispatch self name (jolt-vector)))))
+(define (jolt-iterator-seq it)
+  (if (jiterator? it)
+      (jolt-seq (jiterator-cur it))
+      (let ((has-next? (iterator-seq-method it "hasNext"))
+            (next (iterator-seq-method it "next")))
+        (let chunks ()
+          (if (jolt-truthy? (has-next? it))
+              (jolt-make-lazy-seq
+                (lambda ()
+                  (let ((buf (make-vector 32)))
+                    (let fill ((n 0))
+                      (if (and (jolt-truthy? (has-next? it)) (fx<? n 32))
+                          (begin (vector-set! buf n (next it)) (fill (fx+ n 1)))
+                          (let ((more (chunks)))
+                            (if (fx=? n 0)
+                                more
+                                (cseq-chunked (make-pvec (if (fx=? n 32) buf (sa-subvector buf 0 n))) 0 more))))))))
+              jolt-nil)))))
+(def-var! "clojure.core" "iterator-seq" jolt-iterator-seq)
+
 ;; A Chez condition's message: "who: text", where text is the &message template
 ;; with each ~s / ~a directive filled by the matching irritant printed as a jolt
 ;; value — "string-append: nil is not a string", not "#[jolt-nil-v1] is not a

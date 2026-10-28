@@ -208,8 +208,13 @@
                             (let loop () (when (fx<? (vec-size self) n) (al-push! (vec-al self) jolt-nil) (loop)))
                             jolt-nil))))
       (cons "capacity" (lambda (self) (with-vec self (->num (vec-cap self)))))
-      (cons "ensureCapacity" (lambda (self n) (with-vec self (when (> (jnum->exact n) 0) (vec-grow! self (jnum->exact n)))) jolt-nil))
-      (cons "trimToSize" (lambda (self) (with-vec self (vec-cap! self (vec-size self))) jolt-nil))
+      ;; both count a structural change as the JDK's do: trimToSize always,
+      ;; ensureCapacity for any positive request, whether or not it grows
+      (cons "ensureCapacity" (lambda (self n)
+                               (with-vec self
+                                 (when (> (jnum->exact n) 0) (vec-mod! self) (vec-grow! self (jnum->exact n))))
+                               jolt-nil))
+      (cons "trimToSize" (lambda (self) (with-vec self (vec-mod! self) (vec-cap! self (vec-size self))) jolt-nil))
       (cons "copyInto" (lambda (self arr)
                          (with-vec self
                            (let loop ((xs (al->list (vec-al self))) (i 0))
