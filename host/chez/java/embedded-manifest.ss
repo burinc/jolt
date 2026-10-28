@@ -84,11 +84,8 @@
     (cons "clone" manifest-attributes-copy)
     (cons "equals" (lambda (self other) (and (jar-attributes? other) (jar-attributes-equal? self other))))
     (cons "hashCode" jar-attributes-hash))))
-(register-seq-arm! jar-attributes?
-  (lambda (a) (let ((ns (lh-nodes (jar-attributes-chain a) #f))) (if (null? ns) jolt-nil (list->cseq (map lh-entry ns))))))
-(register-count-arm! jar-attributes? (lambda (a) (lh-size (jar-attributes-chain a))))
-(register-contains-arm! jar-attributes? (lambda (a k) (and (lh-node (jar-attributes-chain a) k) #t)))
-(register-get-arm! jar-attributes? (lambda (a k d) (lh-get (jar-attributes-chain a) k d)))
+;; seq, count, contains? and get answer through linked-hash.ss's arms (lh-kind),
+;; which already sit behind the HashMap family's.
 (register-eq-arm! (lambda (a b) (and (jar-attributes? a) (jar-attributes? b))) jar-attributes-equal?)
 (register-hash-arm! jar-attributes? jar-attributes-hash)
 
