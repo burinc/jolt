@@ -180,6 +180,10 @@
   (d! "__chunk-vec" doseq-chunk-vec) (d! "__chunk-start" doseq-chunk-start)
   (d! "__chunk-end" doseq-chunk-end) (d! "__chunk-after" doseq-chunk-after)
   (d! "__chunk-nth" doseq-chunk-nth))
+;; and private: out of ns-publics, as the reference's chunk walk names no public
+;; helper of its own (host-contract.ss lets the expansion's call through)
+(for-each (lambda (n) (set-var-meta! "clojure.core" n (jolt-hash-map (keyword #f "private") #t)))
+  '("__chunk-vec" "__chunk-start" "__chunk-end" "__chunk-after" "__chunk-nth"))
 (let ((d! (lambda (n v) (def-var! "clojure.core" n v))))
   (d! "chunk-buffer" na-chunk-buffer) (d! "chunk-append" na-chunk-append)
   (d! "chunk" na-chunk) (d! "chunk-cons" na-chunk-cons)
