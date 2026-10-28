@@ -2232,6 +2232,7 @@
     "java.util.concurrent.ConcurrentHashMap$KeySpliterator" "java.util.concurrent.ConcurrentHashMap$ValueSpliterator"
     "java.util.concurrent.ConcurrentHashMap$EntrySpliterator"
     "java.util.WeakHashMap$KeySpliterator" "java.util.WeakHashMap$ValueSpliterator" "java.util.WeakHashMap$EntrySpliterator"
+    "java.util.stream.StreamSpliterators$WrappingSpliterator"
     "java.util.IdentityHashMap$KeySpliterator" "java.util.IdentityHashMap$ValueSpliterator" "java.util.IdentityHashMap$EntrySpliterator"))
 (define spl-tag-of (make-hashtable string-hash string=?))
 (jch-register-supers! "java.util.Spliterator" '())
@@ -2290,7 +2291,9 @@
 (define spl-none (list 'spl-none))
 (define (spl-split! x)
   (spl-force! x)
-  (case (spl-ref x 0)
+  (case (if (string=? (spl-ref x 7) "java.util.stream.StreamSpliterators$WrappingSpliterator") 'none (spl-ref x 0))
+    ;; a sequential pipeline's does not split
+    ((none) jolt-nil)
     ((live)
      (let* ((lo (spl-ref x 2)) (hi (spl-ref x 3)) (l (spl-ref x 1)))
        (if (string=? (spl-ref x 7) "java.util.LinkedList$LLSpliterator")
@@ -2473,13 +2476,54 @@
 ;; Stream.spliterator: the source collection's own when the stream came straight
 ;; from one (a head stream, as the JDK's pipeline head answers), else one over
 ;; the elements; either way it consumes the stream
-(register-host-methods! "stream"
-  (list (cons "spliterator"
-              (lambda (self)
-                (let ((src (stream-source self)) (xs (stream-take! self)))
-                  (if src
-                      (jx-call src "spliterator" '())
-                      (make-iter-spl "java.util.Spliterators$IteratorSpliterator" spl-ORDERED (make-jiterator xs) spl-long-max)))))))
+;; A pipeline's (a stream after an intermediate op) is the JDK's
+;; StreamSpliterators$WrappingSpliterator: what its source reports, ORDERED,
+;; DISTINCT, SORTED, SIZED and SUBSIZED only, edited by each operation as the
+;; JDK's StreamOpFlags edit it, and sized to the source (exactly, while SIZED
+;; holds). A sequential one does not split. Every stream class answers it.
+(define (spl-pipeline-base origin)
+  ;; (characteristics . estimate) of what the pipeline started from
+  (case (and (pair? origin) (car origin))
+    ((coll) (let ((sp (jx-call (cdr origin) "spliterator" '())))
+              (cons (jnum->exact (jx-call sp "characteristics" '())) (jnum->exact (jx-call sp "estimateSize" '())))))
+    ((array) (cons (fxior spl-ORDERED spl-SIZED spl-SUBSIZED) (cdr origin)))
+    ((range) (cons (fxior spl-ORDERED spl-DISTINCT spl-SORTED spl-SIZED spl-SUBSIZED) (cdr origin)))
+    ((generate) (cons 0 spl-long-max))
+    (else (cons spl-ORDERED spl-long-max))))
+(define (spl-pipeline-shape origin ops)
+  (let ((keep (fxior spl-ORDERED spl-DISTINCT spl-SORTED spl-SIZED spl-SUBSIZED))
+        (unsized (lambda (f) (fxand f (fxnot (fxior spl-SIZED spl-SUBSIZED)))))
+        (sized? (lambda (f) (not (fx=? 0 (fxand f spl-SIZED))))))
+    (let loop ((ops (reverse ops))
+               (f (fxand (car (spl-pipeline-base origin)) keep))
+               (n (cdr (spl-pipeline-base origin))))
+      (if (null? ops)
+          (cons f n)
+          (let ((op (car ops)))
+            (case (if (pair? op) (car op) op)
+              ((map) (loop (cdr ops) (fxand f (fxnot (fxior spl-DISTINCT spl-SORTED))) n))
+              ((filter) (loop (cdr ops) (unsized f) n))
+              ((flat) (loop (cdr ops) (unsized (fxand f (fxnot (fxior spl-DISTINCT spl-SORTED)))) n))
+              ((sorted) (loop (cdr ops) (fxior f spl-SORTED spl-ORDERED) n))
+              ((sorted-by) (loop (cdr ops) (fxior (fxand f (fxnot spl-SORTED)) spl-ORDERED) n))
+              ((distinct) (loop (cdr ops) (unsized (fxior f spl-DISTINCT)) n))
+              ((unordered) (loop (cdr ops) (fxand f (fxnot spl-ORDERED)) n))
+              ((limit) (loop (cdr ops) f (if (sized? f) (min n (cdr op)) n)))
+              ((skip) (loop (cdr ops) f (if (sized? f) (max 0 (- n (cdr op))) n)))
+              (else (loop (cdr ops) f n))))))))
+(define (stream-spliterator self)
+  (let* ((src (stream-source self)) (ops (stream-ops self)) (origin (stream-origin self)) (xs (stream-take! self)))
+    (cond ((pair? ops)
+           (let ((shape (spl-pipeline-shape origin ops)))
+             (make-spl "java.util.stream.StreamSpliterators$WrappingSpliterator" 'iter (make-jiterator xs)
+                       0 (cdr shape) (car shape) jolt-nil)))
+          (src (jx-call src "spliterator" '()))
+          ((and (pair? origin) (eq? (car origin) 'array))
+           (make-vec-spl "java.util.Spliterators$ArraySpliterator" (fxior spl-ORDERED spl-SIZED spl-SUBSIZED spl-IMMUTABLE)
+                         (seq->list (jolt-seq xs))))
+          (else (make-iter-spl "java.util.Spliterators$IteratorSpliterator" spl-ORDERED (make-jiterator xs) spl-long-max)))))
+(for-each (lambda (t) (register-host-methods! t (list (cons "spliterator" stream-spliterator))))
+          '("stream" "int-stream" "long-stream" "double-stream"))
 ;; Spliterators and StreamSupport
 (define (spl-chars c) (jnum->exact c))
 (register-class-statics! "java.util.Spliterators"

@@ -24,10 +24,18 @@
 (define (stream? x) (and (jhost? x) (assoc (jhost-tag x) stream-tags) #t))
 (define (stream-kind s) (cdr (assoc (jhost-tag s) stream-tags)))
 (define (kind-tag k) (car (find (lambda (p) (eq? (cdr p) k)) stream-tags)))
-;; state: #(seq consumed? close-handlers source): source is the collection a
-;; Collection.stream() came from, whose own spliterator the stream hands back
-(define (make-stream kind seq) (make-jhost (kind-tag kind) (vector seq #f '() #f)))
+;; state: #(seq consumed? close-handlers source origin ops): source is the
+;; collection a Collection.stream() came from, whose own spliterator a head
+;; stream hands back. origin and ops describe the pipeline for Stream.spliterator
+;; (jutil-concurrent.ss): origin is what the head was made from — (coll . c),
+;; (array . n), (range . n), (iterate), (generate) or #f — and ops the
+;; intermediate operations since, newest first, each a symbol or (op . arg).
+(define (make-stream kind seq) (make-jhost (kind-tag kind) (vector seq #f '() #f #f '())))
+(define (make-stream-from kind seq origin)
+  (let ((s (make-stream kind seq))) (vector-set! (jhost-state s) 4 origin) s))
 (define (stream-source s) (vector-ref (jhost-state s) 3))
+(define (stream-origin s) (vector-ref (jhost-state s) 4))
+(define (stream-ops s) (vector-ref (jhost-state s) 5))
 
 ;; Take a stream's elements, marking it used: every op, intermediate or
 ;; terminal, links or consumes the stream it is called on exactly once.
@@ -39,10 +47,14 @@
     (vector-ref st 0)))
 ;; An intermediate op: a new stream of KIND over (f seq), carrying the close
 ;; handlers along so closing the end of a pipeline runs them all.
-(define (stream-derive s kind f)
-  (let* ((handlers (vector-ref (jhost-state s) 2))
-         (n (make-stream kind (f (stream-take! s)))))
-    (vector-set! (jhost-state n) 2 handlers)
+(define (stream-derive s kind f . op)
+  ;; OP names the operation for the pipeline description (none: it changes
+  ;; nothing a spliterator reports)
+  (let* ((st (jhost-state s)) (handlers (vector-ref st 2))
+         (n (make-stream kind (f (stream-take! s)))) (nst (jhost-state n)))
+    (vector-set! nst 2 handlers)
+    (vector-set! nst 4 (or (vector-ref st 4) (and (vector-ref st 3) (cons 'coll (vector-ref st 3)))))
+    (vector-set! nst 5 (if (pair? op) (cons (car op) (vector-ref st 5)) (cons 'same (vector-ref st 5))))
     n))
 
 ;; ---- the pipeline: one element at a time ----------------------------------------
@@ -145,7 +157,8 @@
 (define (stream-map s method kind)
   (lambda (f)
     (stream-derive s kind
-      (lambda (xs) (st-map (lambda (x) (kind-coerce kind (jolt-fi-call f method x))) xs)))))
+      (lambda (xs) (st-map (lambda (x) (kind-coerce kind (jolt-fi-call f method x))) xs))
+      'map)))
 
 (define (stream-sum k s)
   (let ((t (stream-fold s 0 +)))
@@ -355,15 +368,16 @@
    (cons "mapToDouble" (lambda (s f) ((stream-map s "applyAsDouble" 'double) f)))
    (cons "boxed" (lambda (s) (stream-derive s 'ref (lambda (xs) xs))))
    (cons "asLongStream" (lambda (s) (stream-derive s 'long (lambda (xs) xs))))
-   (cons "asDoubleStream" (lambda (s) (stream-derive s 'double (lambda (xs) (st-map inexact xs)))))
-   (cons "filter" (lambda (s p) (stream-derive s (stream-kind s) (lambda (xs) (st-filter (st-test p) xs)))))
+   (cons "asDoubleStream" (lambda (s) (stream-derive s 'double (lambda (xs) (st-map inexact xs)) 'map)))
+   (cons "filter" (lambda (s p) (stream-derive s (stream-kind s) (lambda (xs) (st-filter (st-test p) xs)) 'filter)))
    (cons "flatMap" (lambda (s f)
                      (stream-derive s (stream-kind s)
                        (lambda (xs)
                          (st-flat-map (lambda (x)
                                         (let ((r (jolt-fi-call f "apply" x)))
                                           (if (stream? r) (stream-take! r) r)))
-                                      xs)))))
+                                      xs))
+                       'flat)))
    (cons "mapMulti" (lambda (s f)
                       (stream-derive s (stream-kind s)
                         (lambda (xs)
@@ -371,22 +385,26 @@
                                          (let ((sink (make-stream-sink)))
                                            (jolt-fi-call f "accept" x sink)
                                            (list->cseq (reverse (vector-ref (jhost-state sink) 0)))))
-                                       xs)))))
+                                       xs))
+                        'flat)))
    (cons "peek" (lambda (s f)
                   (stream-derive s (stream-kind s)
-                    (lambda (xs) (st-map (lambda (x) (jolt-fi-call f "accept" x) x) xs)))))
-   (cons "limit" (lambda (s n) (stream-derive s (stream-kind s) (lambda (xs) (st-take (jnum->exact n) xs)))))
-   (cons "skip" (lambda (s n) (stream-derive s (stream-kind s) (lambda (xs) (st-drop (jnum->exact n) xs)))))
-   (cons "distinct" (lambda (s) (stream-derive s (stream-kind s) st-distinct)))
+                    (lambda (xs) (st-map (lambda (x) (jolt-fi-call f "accept" x) x) xs))
+                    'same)))
+   (cons "limit" (lambda (s n) (stream-derive s (stream-kind s) (lambda (xs) (st-take (jnum->exact n) xs)) (cons 'limit (jnum->exact n)))))
+   (cons "skip" (lambda (s n) (stream-derive s (stream-kind s) (lambda (xs) (st-drop (jnum->exact n) xs)) (cons 'skip (jnum->exact n)))))
+   (cons "distinct" (lambda (s) (stream-derive s (stream-kind s) st-distinct 'distinct)))
    (cons "sorted" (lambda (s . cmp)
                     (stream-derive s (stream-kind s)
                       (lambda (xs) (list->cseq (jcoll-sorted (seq->list (jolt-seq xs))
-                                                             (if (pair? cmp) (car cmp) jolt-nil)))))))
-   (cons "takeWhile" (lambda (s p) (stream-derive s (stream-kind s) (lambda (xs) (st-take-while (st-test p) xs)))))
-   (cons "dropWhile" (lambda (s p) (stream-derive s (stream-kind s) (lambda (xs) (st-drop-while (st-test p) xs)))))
+                                                             (if (pair? cmp) (car cmp) jolt-nil))))
+                      (if (and (pair? cmp) (not (jolt-nil? (car cmp)))) 'sorted-by 'sorted))))
+   (cons "takeWhile" (lambda (s p) (stream-derive s (stream-kind s) (lambda (xs) (st-take-while (st-test p) xs)) 'filter)))
+   (cons "dropWhile" (lambda (s p) (stream-derive s (stream-kind s) (lambda (xs) (st-drop-while (st-test p) xs)) 'filter)))
    ;; sequential execution is all there is, so these are the stream itself
    (cons "sequential" (lambda (s) s)) (cons "parallel" (lambda (s) s))
-   (cons "unordered" (lambda (s) s)) (cons "isParallel" (lambda (s) #f))
+   (cons "unordered" (lambda (s) (stream-derive s (stream-kind s) (lambda (xs) xs) 'unordered)))
+   (cons "isParallel" (lambda (s) #f))
    (cons "onClose" (lambda (s h)
                      (vector-set! (jhost-state s) 2 (cons h (vector-ref (jhost-state s) 2)))
                      s))
@@ -447,33 +465,34 @@
 ;; arrive from Clojure; anything else is the elements spelled out.
 (define (stream-of kind)
   (lambda args
-    (make-stream kind
-      (if (and (pair? args) (null? (cdr args)) (jolt-array? (car args)))
-          (list->cseq (ja->list (car args)))
-          (list->cseq args)))))
+    (let ((xs (if (and (pair? args) (null? (cdr args)) (jolt-array? (car args))) (ja->list (car args)) args)))
+      (make-stream-from kind (list->cseq xs) (cons 'array (length xs))))))
 (define (stream-iterate kind)
   (case-lambda
-    ((seed f) (make-stream kind (jolt-iterate (lambda (x) (jolt-fi-call f (kind-unary-method kind) x)) seed)))
+    ((seed f) (make-stream-from kind (jolt-iterate (lambda (x) (jolt-fi-call f (kind-unary-method kind) x)) seed) '(iterate)))
     ;; iterate(seed, hasNext, next) — the for-loop form (JDK 9)
     ((seed has-next f)
-     (make-stream kind
+     (make-stream-from kind
        (st-take-while (lambda (x) (jolt-truthy? (jolt-fi-call has-next "test" x)))
-                      (jolt-iterate (lambda (x) (jolt-fi-call f (kind-unary-method kind) x)) seed))))))
+                      (jolt-iterate (lambda (x) (jolt-fi-call f (kind-unary-method kind) x)) seed))
+       '(iterate)))))
 (define (stream-concat kind)
   (lambda (a b) (make-stream kind (jolt-concat (stream-take! a) (stream-take! b)))))
 (define (stream-range closed?)
   (lambda (kind)
     (lambda (from to)
       (let ((from (jnum->exact from)) (to (jnum->exact to)))
-        (make-stream kind (jolt-invoke2 (clj "range") from (if closed? (+ to 1) to)))))))
+        (let ((to (if closed? (+ to 1) to)))
+          (make-stream-from kind (jolt-invoke2 (clj "range") from to) (cons 'range (max 0 (- to from)))))))))
 (define (stream-statics kind)
   (append
    (list (cons "of" (stream-of kind))
          (cons "empty" (lambda () (make-stream kind jolt-nil)))
          (cons "iterate" (stream-iterate kind))
          (cons "generate" (lambda (f)
-                            (make-stream kind (jolt-invoke1 (clj "repeatedly")
-                                                            (lambda () (jolt-fi-call f "get"))))))
+                            (make-stream-from kind (jolt-invoke1 (clj "repeatedly")
+                                                                 (lambda () (jolt-fi-call f "get")))
+                                              '(generate))))
          (cons "concat" (stream-concat kind)))
    (if (eq? kind 'ref)
        (list (cons "ofNullable" (lambda (x) (make-stream 'ref (if (jolt-nil? x) jolt-nil (list->cseq (list x)))))))
@@ -499,9 +518,9 @@
                                (let ((from (jnum->exact (car range))) (to (jnum->exact (cadr range))))
                                  (list-head (list-tail xs from) (- to from)))
                                xs)))
-                  (make-stream (case (jolt-array-kind arr)
-                                 ((int) 'int) ((long) 'long) ((double) 'double) (else 'ref))
-                               (list->cseq xs)))))))
+                  (make-stream-from (case (jolt-array-kind arr)
+                                      ((int) 'int) ((long) 'long) ((double) 'double) (else 'ref))
+                                    (list->cseq xs) (cons 'array (length xs))))))))
 
 ;; Collection.stream() on every collection that is a java.util.Collection — the
 ;; persistent vector, set and list and every seq, and the ArrayList / HashSet
