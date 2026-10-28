@@ -75,7 +75,37 @@
                         (cond ((null? ss) acc)
                               ((member (car ss) acc) (add (cdr ss) acc))
                               (else (add (cdr ss) (append acc (list (car ss)))))))))
+    ;; the name tables are derived from the rows too (jch-set-supers! resets
+    ;; them the same way); left alone, jch-known? missed a class registered here
+    (set! jch-known-cache #f)
+    (set! jch-simple->fqn-cache #f)
+    (set! jch-jvm-name-cache #f)
     (jch-invalidate!/locked)))
+
+;; Register a class no other class can name as a super yet — a reify form's or a
+;; proxy's generated class, made the moment it is first asked for. Adding such a
+;; leaf changes no other class's ancestry, so nothing derived from the graph goes
+;; stale: the epoch is not bumped (which would flush every dispatch cache, once
+;; per reify form evaluated), only the new name's own memo entries are dropped,
+;; and the name tables take it in place. A name the graph already has goes the
+;; ordinary way.
+(define (jch-register-leaf! name supers)
+  (let ((new? (jolt-with-mutex jch-cache-mutex
+                (and (not (hashtable-contains? jvm-class-parents name))
+                     (begin
+                       (hashtable-set! jvm-class-parents name supers)
+                       (hashtable-delete! jch-closure-cache name)
+                       (hashtable-delete! jch-tags-cache name)
+                       (let ((k jch-known-cache))
+                         (when k
+                           (for-each (lambda (n) (hashtable-set! k n #t) (hashtable-set! k (jch-last-segment n) #t))
+                                     (cons name supers))))
+                       (set! jch-simple->fqn-cache #f)
+                       (set! jch-jvm-name-cache #f)
+                       #t)))))
+    (if new?
+        (jch-class-registered-hook name)
+        (jch-register-supers! name supers))))
 
 ;; A munged fn class name "ns$name" (jolt-class for a def'd fn) isn't in the
 ;; table; like the JVM (a fn extends clojure.lang.AFunction) its super is
