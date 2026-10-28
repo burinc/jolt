@@ -1412,6 +1412,25 @@
     (string-append "(let [[r t] (jolt.host/image-read \"" tmp "\")] [(record? r) (map? r) (vec (keys r)) (pr-str r) (record? t) (contains? (supers (class t)) clojure.lang.IType) (clojure.string/replace (pr-str t) #\"(0x|@)[0-9a-f]+\" \"$1H\")])")
     "[true true [:a :b] #user.ImgRec13{:a 1, :b 2} false true #object[user.ImgTyp13 0xH \"user.ImgTyp13@H\"]]")
 
+;; Format 14: an image written before it holds an ArrayDeque as the list layout
+;; #(backing count head) and an ArrayList with no modCount slot. Both still
+;; work once read: the deque becomes a ring buffer on first use, the list counts
+;; from 0 and gains the slot on its first change, so its iterators fail fast.
+(def-var! "user" "legacy-dq" (make-jhost "arraydeque" (vector (vector jolt-nil 1 2 3 jolt-nil) 3 1)))
+(def-var! "user" "legacy-al" (make-jhost "arraylist" (vector (vector 7 8 jolt-nil) 2 0)))
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" [legacy-dq legacy-al])"))
+(is "format 14: an old-layout ArrayDeque and ArrayList read and work"
+    (string-append "(let [[d l] (jolt.host/image-read \"" tmp "\")] [(vec d) (.pollFirst d) (do (.addFirst d 0) (.addLast d 9) (vec d)) (count d) (vec l) (let [it (.iterator l)] (.next it) (.add l 9) (try (.next it) :no-cme (catch java.util.ConcurrentModificationException _ :cme))) (vec l)])")
+    "[[1 2 3] 1 [0 2 3 9] 4 [7 8] :cme [7 8 9]]")
+;; The list layout let a nil in ((.add d nil) was accepted); the ring buffer
+;; marks an empty slot with nil, so such a deque cannot become one. Reading it
+;; is refused by name rather than turning the nil into a hole.
+(def-var! "user" "legacy-dq-nil" (make-jhost "arraydeque" (vector (vector 1 jolt-nil 2) 3 0)))
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" [legacy-dq-nil])"))
+(is "format 14: an old-layout ArrayDeque holding nil is refused on read"
+    (string-append "(try (jolt.host/image-read \"" tmp "\") :read (catch Exception e (ex-message e)))")
+    "image: cannot read a java.util.ArrayDeque at 0 -> 0: it holds nil, which an ArrayDeque cannot (an image written before format 14 let one in)")
+
 ;; --- the same proof for the COLLECTION records and their metadata. Format 7
 ;; carried a vector/map/set/list/lazy-seq/() as the slotless records
 ;; (chez-pvec-v3, chez-pmap-v5, chez-pset-v2, chez-cseq-v6, jolt-lazyseq-v2,

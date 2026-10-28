@@ -2926,6 +2926,7 @@
 ;; the single JVM class/interface graph — value-host-tags, instance?, isa?/supers,
 ;; and the exception hierarchy all derive from it. Before records.ss so
 ;; value-host-tags can build on jch-tags.
+(load "host/chez/java/jdk-interfaces.ss")   ; java.base's public interfaces (generated)
 (load "host/chez/java/class-hierarchy.ss")
 
 ;; records + protocols: defrecord/deftype/defprotocol/
@@ -3104,6 +3105,7 @@
 ;; Vector, Stack, Hashtable, BitSet, PriorityQueue and the java.util.concurrent
 ;; collections, over the jx registry jutil-views.ss keeps.
 (load "host/chez/java/jutil-concurrent.ss")
+(load "host/chez/java/array-deque.ss")        ; java.util.ArrayDeque, a ring buffer
 
 ;; java.io byte/char streams (FileInputStream/…/ByteArrayOutputStream/Buffered*)
 ;; over Chez ports. After io.ss (extends its slurp/__close/reader-jhost?) and

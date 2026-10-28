@@ -58,6 +58,7 @@
 (##include "../chez/natives-coll.ss")
 (##include "../chez/natives-num.ss")
 (##include "../chez/multimethods.ss")
+(##include "../chez/java/jdk-interfaces.ss")
 (##include "../chez/java/class-hierarchy.ss")
 (##include "records-gambit.ss")  ;; GENERATED from records.ss (make gambitgen) — phase wall, see gen-records.ss
 (##include "../chez/java/records-interop.ss")

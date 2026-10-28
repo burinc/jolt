@@ -75,7 +75,41 @@
                         (cond ((null? ss) acc)
                               ((member (car ss) acc) (add (cdr ss) acc))
                               (else (add (cdr ss) (append acc (list (car ss)))))))))
+    ;; the name tables are derived from the rows too (jch-set-supers! resets
+    ;; them the same way); left alone, jch-known? missed a class registered here
+    (set! jch-known-cache #f)
+    (set! jch-simple->fqn-cache #f)
+    (set! jch-jvm-name-cache #f)
     (jch-invalidate!/locked)))
+
+;; Register a class no other class can name as a super yet — a reify form's or a
+;; proxy's generated class, made the moment it is first asked for. Adding such a
+;; leaf changes no other class's ancestry, so nothing derived from the graph goes
+;; stale: the epoch is not bumped (which would flush every dispatch cache, once
+;; per reify form evaluated), only the new name's own memo entries are dropped,
+;; and the name tables take it in place. A name the graph already has goes the
+;; ordinary way.
+(define (jch-register-leaf! name supers)
+  (let ((new? (jolt-with-mutex jch-cache-mutex
+                (and (not (hashtable-contains? jvm-class-parents name))
+                     (begin
+                       (hashtable-set! jvm-class-parents name supers)
+                       (hashtable-delete! jch-closure-cache name)
+                       (hashtable-delete! jch-tags-cache name)
+                       ;; the known-name table is published whole and read with no
+                       ;; lock: add to a copy and publish that
+                       (let ((k jch-known-cache))
+                         (when k
+                           (let ((c (hashtable-copy k #t)))
+                             (for-each (lambda (n) (hashtable-set! c n #t) (hashtable-set! c (jch-last-segment n) #t))
+                                       (cons name supers))
+                             (set! jch-known-cache c))))
+                       (set! jch-simple->fqn-cache #f)
+                       (set! jch-jvm-name-cache #f)
+                       #t)))))
+    (if new?
+        (jch-class-registered-hook name)
+        (jch-register-supers! name supers))))
 
 ;; A munged fn class name "ns$name" (jolt-class for a def'd fn) isn't in the
 ;; table; like the JVM (a fn extends clojure.lang.AFunction) its super is
@@ -318,7 +352,16 @@
 (define (jch-mark-interface! name)
   (unless (or (string=? name "java.lang.Object") (string=? name "Object"))
     (jolt-with-mutex jch-cache-mutex (hashtable-set! jch-interface-set name #t))))
-(define (jch-interface? name) (hashtable-ref jch-interface-set name #f))
+;; an interface the graph marked, or one of java.base's (jdk-interfaces.ss)
+(define (jch-interface? name)
+  (or (hashtable-ref jch-interface-set name #f) (hashtable-ref jdk-public-interfaces name #f)))
+;; a java.* / javax.* name that is not an interface: a JDK class, whether or not
+;; the graph models it (a proxy over java.util.TimerTask extends it)
+(define (jch-jdk-class? name)
+  (and (string? name)
+       (or (and (fx>? (string-length name) 5) (string=? (substring name 0 5) "java."))
+           (and (fx>? (string-length name) 6) (string=? (substring name 0 6) "javax.")))
+       (not (jch-interface? name))))
 (for-each jch-mark-interface!
           '("clojure.lang.Seqable" "clojure.lang.Sequential" "clojure.lang.Sorted"
             "clojure.lang.Reversible" "clojure.lang.Indexed" "clojure.lang.Counted"
@@ -988,6 +1031,8 @@
 (jch-register-supers! "java.util.ArrayDeque" '("java.util.Deque"))
 (jch-register-supers! "java.util.HashMap" '("java.util.Map"))
 (jch-register-supers! "java.util.concurrent.ConcurrentMap" '("java.util.Map"))
+(jch-register-supers! "java.util.WeakHashMap" '("java.util.AbstractMap" "java.util.Map"))
+(jch-register-supers! "java.util.IdentityHashMap" '("java.util.AbstractMap" "java.util.Map" "java.io.Serializable" "java.lang.Cloneable"))
 (jch-register-supers! "java.util.concurrent.ConcurrentHashMap"
                       '("java.util.AbstractMap" "java.util.concurrent.ConcurrentMap" "java.io.Serializable"))
 (jch-register-supers! "java.util.LinkedHashMap" '("java.util.HashMap" "java.util.SequencedMap"))
@@ -1518,6 +1563,8 @@
     ("arraydeque" . "java.util.ArrayDeque")
     ("hashmap" . "java.util.HashMap")
     ("chm" . "java.util.concurrent.ConcurrentHashMap")
+    ("jx-weak-hashmap" . "java.util.WeakHashMap")
+    ("jx-identity-hashmap" . "java.util.IdentityHashMap")
     ("linkedhashmap" . "java.util.LinkedHashMap")
     ("properties" . "java.util.Properties")
     ("hashset" . "java.util.HashSet")
