@@ -46,8 +46,12 @@
       (let ((c (make-cseqv (vector-ref v i) next sk-chunked-cons jolt-nil chunk i more)))
         (if (fx=? i 0) c (loop (fx- i 1) c))))))
 (define (jolt-iterator-seq it)
-  (if (jiterator? it)
-      (jolt-seq (jiterator-cur it))
+  (cond
+    ((jiterator? it) (jolt-seq (jiterator-cur it)))
+    ;; anything that cannot be an Iterator — a jolt collection, nil — seqs as
+    ;; itself: the documented superset (the JVM raises ClassCastException)
+    ((not (or (jhost? it) (jreify? it) (jrec? it))) (jolt-seq it))
+    (else
       (let* ((has-next? (iterator-seq-method it "hasNext"))
              (next (iterator-seq-method it "next"))
             (fill (let ((e (and (jhost? it) (assoc (jhost-tag it) iterator-seq-fills))))
@@ -66,7 +70,7 @@
                     (if (fx=? n 0)
                         more
                         (iterator-seq-chunk (if (fx=? n 32) buf (sa-subvector buf 0 n)) more)))))
-              jolt-nil)))))
+              jolt-nil))))))
 (def-var! "clojure.core" "iterator-seq" jolt-iterator-seq)
 
 ;; A Chez condition's message: "who: text", where text is the &message template
