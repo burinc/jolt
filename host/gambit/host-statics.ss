@@ -230,8 +230,6 @@
                                     ((macos) "Mac OS X")
                                     ((windows) "Windows")
                                     (else "Linux")))
-          ;; the Java version both hosts answer as (Chez: jolt-java-feature-version)
-          ((or (string=? k "java.version") (string=? k "java.specification.version")) "21")
           ((string=? k "line.separator") "\n")
           ((string=? k "file.separator") "/")
           ((string=? k "path.separator") ":")

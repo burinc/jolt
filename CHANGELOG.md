@@ -120,9 +120,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **`java.version` and `java.specification.version` report 21**, the JDK jolt's
-  oracle certifies against, and so do `Runtime/version` and
-  `JarFile/runtimeVersion`. They answered `nil` before.
+- **`Runtime/version` and `JarFile/runtimeVersion` report 21**, the JDK jolt's
+  oracle certifies against, and that version picks a multi-release jar's
+  entries. The `java.version` property stays `nil`, as before.
 - `Files/readAllLines` splits on `\r` as well as `\n` and `\r\n`, and raises
   `MalformedInputException` on bytes its charset cannot decode.
 - **A HashMap's `keySet`, `values` and `entrySet` are live views**

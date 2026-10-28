@@ -733,10 +733,9 @@
     (hashtable-set! zentry-real-names (zentry-of entry) source)
     entry))
 
-;; java.lang.Runtime.Version. jolt answers for one Java version, the one its
-;; JVM oracle certifies against (host-static-methods.ss jolt-java-feature-version),
-;; and Runtime.version(), JarFile.runtimeVersion() and the java.version property
-;; all report it.
+;; java.lang.Runtime.Version. jolt models one Java version, the one its JVM
+;; oracle certifies against (host-static-methods.ss jolt-java-feature-version);
+;; Runtime.version() and JarFile.runtimeVersion() both report it.
 (define (make-runtime-version version)
   (make-jhost "runtime-version" version))
 (define (runtime-version-feature self) (car (jhost-state self)))

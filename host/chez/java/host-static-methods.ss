@@ -1255,14 +1255,13 @@
             ((string=? acc "") (loop (cdr roots) (car roots)))
             (else (loop (cdr roots) (string-append acc sep (car roots))))))))
 
-;; The Java version jolt answers as: the JDK its JVM oracle certifies against
-;; (test/conformance/profile.edn :oracle-jdk). java.version and
-;; java.specification.version report it, and so do Runtime.version() and
-;; JarFile.runtimeVersion() (zip-file.ss), which picks a multi-release jar's
-;; entries -- one number, so a library that reads the property and one that asks
-;; the jar see the same Java.
+;; The Java version jolt models: the JDK its JVM oracle certifies against
+;; (test/conformance/profile.edn :oracle-jdk). Runtime.version() and
+;; JarFile.runtimeVersion() (zip-file.ss) report it, and it picks a
+;; multi-release jar's entries. The java.version and java.specification.version
+;; PROPERTIES stay nil on purpose (sysprops-test.clj): libraries parse them to
+;; switch on JVM-only code paths, and there is no JDK under jolt to switch to.
 (define jolt-java-feature-version 21)
-(define jolt-java-version-string (number->string jolt-java-feature-version))
 (define (sys-get-property k . dflt)
   (let* ((k (jolt-need-string k))
          (set-val (hashtable-ref sys-prop-table k #f)))
@@ -1272,7 +1271,6 @@
           ((string=? k "os.version") (sys-os-version))
           ((string=? k "user.name") (sys-user-name))
           ((string=? k "jolt.version") (jolt-version-string))
-          ((or (string=? k "java.version") (string=? k "java.specification.version")) jolt-java-version-string)
           ((string=? k "line.separator") "\n")
           ((string=? k "file.separator") (file-separator))
           ((string=? k "path.separator") (path-list-separator))
@@ -1296,8 +1294,6 @@
                              "path.separator" (path-list-separator)
                              "java.class.path" (sys-class-path)
                              "jolt.version" (jolt-version-string)
-                             "java.version" jolt-java-version-string
-                             "java.specification.version" jolt-java-version-string
                              "user.dir" (jolt-user-dir) "user.home" (or (getenv "HOME") "")
                              "java.io.tmpdir" (host-temp-dir))))
     ;; keys whose value can be absent join only when they answer — a JVM

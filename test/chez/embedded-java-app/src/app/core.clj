@@ -114,9 +114,8 @@
   (check "below base version never selected" (io/resource "below7.txt") nil)
   ;; nothing in the archive answers the empty name (a source root on disk may)
   (check "empty resource name" (= "jar" (some-> (io/resource "") .getProtocol)) false)
-  (check "runtime version is the reported Java version"
-         [(str (java.util.jar.JarFile/runtimeVersion)) (str (.feature (Runtime/version)))]
-         [(System/getProperty "java.specification.version") (System/getProperty "java.version")])
+  (check "runtime version is the modeled Java version"
+         (str (java.util.jar.JarFile/runtimeVersion)) (str (.feature (Runtime/version))))
   ;; ParseUtil.encodePath: lowercase escapes, ";" and "=" escaped too
   (let [name "encoded/001 my café;v=1.sql"
         url (io/resource name)]
@@ -160,7 +159,7 @@
     (check "multi release" (.isMultiRelease jar) true)
     (check "runtime version" (str (.getVersion jar)) "8")
     (check "base version" (str (java.util.jar.JarFile/baseVersion)) "8")
-    (check "current version" (str (java.util.jar.JarFile/runtimeVersion)) (System/getProperty "java.specification.version"))
+    (check "current version" (str (java.util.jar.JarFile/runtimeVersion)) "21")
     (check "manifest cached" (identical? manifest (.getManifest jar)) true)
     (check "default selected content" (slurp (.getInputStream jar entry)) "embedded resource ok\n")
     (check "entry real name" (.getRealName entry) "greeting.txt")
