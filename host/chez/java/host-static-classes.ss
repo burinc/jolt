@@ -291,6 +291,21 @@
             (jch-register-supers! (cadr r) (if (caddr r) '("java.util.ListIterator") '("java.util.Iterator")))
             (register-host-methods! (car r) (if (caddr r) al-listitr-methods al-itr-methods)))
           al-iterator-classes)
+;; iterator-seq's chunk fill (records-dispatch.ss): up to 32 rounds of hasNext
+;; and next with nothing between them, so the count is checked once and the
+;; elements copied; any state where next would throw goes back to the loop.
+(define (ali-fill it buf)
+    (let* ((st (jhost-state it)) (lst (jhost-state (vector-ref st 0)))
+           (e (vector-ref st 3)) (c (vector-ref st 1)) (size (vector-ref lst 1)))
+      (and (or (not e) (fx=? e (if (fx>? (vector-length lst) 3) (vector-ref lst 3) 0)))
+           (fx>=? c 0) (fx<=? c size)
+           (let ((n (fxmin 32 (fx- size c))) (v (vector-ref lst 0)) (base (fx+ (vector-ref lst 2) c)))
+             (do ((j 0 (fx+ j 1))) ((fx=? j n)) (vector-set! buf j (vector-ref v (fx+ base j))))
+             (when (fx>? n 0)
+               (vector-set! st 1 (fx+ c n))
+               (vector-set! st 2 (fx+ c (fx- n 1))))
+             n))))
+(register-iterator-seq-fill! (map car al-iterator-classes) ali-fill ali-next)
 ;; (seq it): what the iterator would hand out from here, as the list is now
 (register-seq-arm-last! (lambda (x) (and (jhost? x) (assoc (jhost-tag x) al-iterator-classes) #t))
   (lambda (it)

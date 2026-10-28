@@ -1024,10 +1024,28 @@
           ((pair? (pqi-ref it 3))
            (let ((x (car (pqi-ref it 3)))) (pqi-set! it 2 -1) (pqi-set! it 3 (cdr (pqi-ref it 3))) (pqi-set! it 4 x) x))
           (else (throw-jvm 'NoSuchElementException jolt-nil)))))
+;; iterator-seq's chunk fill (records-dispatch.ss): up to 32 nexts, the count
+;; checked once, since nothing runs between them
+(define (pqi-fill it buf)
+  (and (fx=? (pqi-ref it 5) (pq-mod (pqi-ref it 0)))
+       (let* ((p (pqi-ref it 0)) (q (pq-q p)) (n (pq-n p)) (c (pqi-ref it 1))
+              (k (if (fx<? c n) (fxmin 32 (fx- n c)) 0)))
+         ;; the heap array first, in one run
+         (do ((j 0 (fx+ j 1))) ((fx=? j k)) (vector-set! buf j (vector-ref q (fx+ c j))))
+         (when (fx>? k 0) (pqi-set! it 2 (fx+ c (fx- k 1))) (pqi-set! it 1 (fx+ c k)))
+         ;; then the elements a remove moved behind the cursor
+         (let loop ((j k))
+           (if (and (fx<? j 32) (pair? (pqi-ref it 3)))
+               (let ((x (car (pqi-ref it 3))))
+                 (pqi-set! it 2 -1) (pqi-set! it 3 (cdr (pqi-ref it 3))) (pqi-set! it 4 x)
+                 (vector-set! buf j x)
+                 (loop (fx+ j 1)))
+               j)))))
+(register-iterator-seq-fill! '("jx-pq-itr") pqi-fill pqi-next!)
 (jx-class! "jx-pq-itr" "java.util.PriorityQueue$Itr" '("java.util.Iterator"))
 (register-host-methods! "jx-pq-itr"
   (list (cons "hasNext" (lambda (self) (pqi-has-next? self)))
-        (cons "next" (lambda (self) (pqi-next! self)))
+        (cons "next" pqi-next!)
         (cons "remove" (lambda (self)
                          (pqi-comod! self)
                          (let ((p (pqi-ref self 0)) (last (pqi-ref self 2)))
