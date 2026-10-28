@@ -1687,6 +1687,14 @@
            :jvm "8"
            :jolt "5"}
    :note "jolt's hash and tree collections do not share the JDK's table and tree layout, so a split falls elsewhere; every element is handed out once, in the same order overall. Class, characteristics, sizes and comparators match (corpus java.util / Spliterator)."}
+  {:category :host-model
+   :behavior "ArrayList.ensureCapacity counting a structural change"
+   :jvm "a change when the request outgrows the private elementData array, whose length follows the JDK's growth policy"
+   :jolt "a change when the request outgrows the buffer jolt holds"
+   :check {:expr "(let [l (java.util.ArrayList. [1 2]) it (.iterator l)] (.next it) (.ensureCapacity l 5) (try (.next it) :ok (catch java.util.ConcurrentModificationException _ :cme)))"
+           :jvm ":cme"
+           :jolt ":ok"}
+   :note "jolt does not keep the JDK's capacity, which nothing else observes; trimToSize, which always counts one, matches. The fail-fast rows in the corpus pin the rest."}
 ]
  :entries
  [;; Wherever a syntax-quote's CONSTRUCTION CODE becomes a value rather than

@@ -3104,6 +3104,7 @@
 ;; Vector, Stack, Hashtable, BitSet, PriorityQueue and the java.util.concurrent
 ;; collections, over the jx registry jutil-views.ss keeps.
 (load "host/chez/java/jutil-concurrent.ss")
+(load "host/chez/java/array-deque.ss")        ; java.util.ArrayDeque, a ring buffer
 
 ;; java.io byte/char streams (FileInputStream/…/ByteArrayOutputStream/Buffered*)
 ;; over Chez ports. After io.ss (extends its slurp/__close/reader-jhost?) and

@@ -510,6 +510,28 @@
 (define (stream-source? x)
   (or (pvec? x) (pset? x) (jolt-seq? x) (jolt-lazyseq? x) (al-family? x) (hs-hashset? x)
       (jutil-collection? x)))
+;; A list that keeps a modCount (ArrayList, LinkedList, Vector) streams live, as
+;; its late-binding spliterator does on the JDK: the size and count are taken
+;; when the stream first pulls an element, the elements are read as the list
+;; stands, and a count that moved by the end of the walk is a
+;; ConcurrentModificationException.
+(define (stream-live-list l)
+  ;; an ArrayList / LinkedList reads its backing directly; a Vector through its
+  ;; own size and get. The elements bound at the first pull go out as one chunk
+  ;; (the walk reads the list as it stands then), and the count is checked once
+  ;; the chunk is used up, before the stream ends.
+  (let* ((al? (al-family? l))
+         (size (lambda () (if al? (al-cnt l) (jnum->exact (record-method-dispatch l "size" jolt-nil)))))
+         (get (lambda (i) (if al? (al-ref l i) (record-method-dispatch l "get" (list->cseq (list (->num i))))))))
+    (jolt-make-lazy-seq
+      (lambda ()
+        (let* ((n (size)) (e (jutil-modcount l))
+               (xs (let loop ((i (fx- n 1)) (acc '())) (if (fx<? i 0) acc (loop (fx- i 1) (cons (get i) acc))))))
+          ;; realized cells, then one lazy tail that makes the check when the
+          ;; walk reaches it
+          (let ((end (jolt-make-lazy-seq
+                       (lambda () (unless (eqv? e (jutil-modcount l)) (jutil-cme!)) jolt-nil))))
+            (fold-right (lambda (x rest) (make-cseq x rest sk-cons jolt-nil)) end xs)))))))
 ;; any other java.util shim that is a Collection (not a Map)
 (define (jutil-collection? x) (and (memq (jutil-coll-kind x) '(set ralist list coll entries)) #t))
 (define arm-priority-stream 29)
@@ -518,11 +540,13 @@
     (if (and (or (string=? name "stream") (string=? name "parallelStream"))
              (stream-source? obj))
         (if (null? (method-rest-args->list rest))
-            (let ((st (make-stream 'ref (if (or (al-family? obj) (hs-hashset? obj) (jutil-collection? obj))
+            (let ((st (make-stream 'ref (if (jutil-modcount obj)
+                                            (stream-live-list obj)
+                                            (if (or (al-family? obj) (hs-hashset? obj) (jutil-collection? obj))
                                             ;; a mutable source is snapshotted, as the JDK's
                                             ;; late-binding spliterator is by the time it runs
                                             (list->cseq (seq->list (jolt-seq obj)))
-                                            obj))))
+                                            obj)))))
               (vector-set! (jhost-state st) 3 obj)
               st)
             (dispatch-miss obj name (method-rest-args->list rest)))

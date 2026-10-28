@@ -69,16 +69,19 @@
 ;; sees it move throws ConcurrentModificationException, as Vector$Itr does
 (define (make-jx-vector tag xs cap incr) (jx-own-monitor! (make-jhost tag (vector (make-arraylist xs) #f cap incr 0)) 1))
 (define (vec-mod v) (vector-ref (jhost-state v) 4))
-(define (vec-mod! v) (vector-set! (jhost-state v) 4 (fx+ 1 (vec-mod v))))
-(define vec-structural '("add" "addAll" "remove" "clear" "removeAll" "retainAll" "removeIf" "replaceAll" "sort"
-                         "removeFirst" "removeLast"))
+(define (vec-mod! v) (vector-set! (jhost-state v) 4 (fxand (fx+ 1 (vec-mod v)) #x3fffffff)))
+(define vec-structural '("add" "addAll" "remove" "clear" "replaceAll" "sort" "removeFirst" "removeLast"))
+;; a change only when they remove something, as Vector's bulkRemove counts one
+(define vec-structural-if-changed '("removeAll" "retainAll" "removeIf"))
 (define (vec-grow! v min)
   (let ((old (vec-cap v)))
     (when (> min old)
       (vec-cap! v (+ old (max (- min old) (if (> (vec-incr v) 0) (vec-incr v) old)))))))
 (define (vec-call v m . args)
   (when (member m vec-structural) (vec-mod! v))
-  (jx-call (vec-al v) m args))
+  (let ((r (jx-call (vec-al v) m args)))
+    (when (and (member m vec-structural-if-changed) (jolt-truthy? r)) (vec-mod! v))
+    r))
 (define-syntax with-vec
   (syntax-rules () ((_ v e ...) (jolt-call-with-monitor (vec-mu v) (lambda () e ...)))))
 ;; the ArrayList members a Vector answers as they are, under its lock
@@ -118,10 +121,10 @@
       (cons "addAll" (case-lambda
                        ((self c) (let ((xs (jxc-elems c)))
                                    (with-vec self (vec-grow! self (+ (vec-size self) (length xs)))
-                                     (vec-call self "addAll" xs))))
+                                     (vec-call self "addAll" (list->cseq xs)))))
                        ((self i c) (let ((xs (jxc-elems c)))
                                      (with-vec self (vec-grow! self (+ (vec-size self) (length xs)))
-                                       (vec-call self "addAll" i xs))))))
+                                       (vec-call self "addAll" i (list->cseq xs)))))))
       (cons "addFirst" (lambda (self x) (with-vec self (vec-grow! self (fx+ 1 (vec-size self))) (vec-call self "add" (->num 0) x)) jolt-nil))
       (cons "addLast" (lambda (self x) (with-vec self (vec-grow! self (fx+ 1 (vec-size self))) (vec-call self "add" x)) jolt-nil))
       (cons "addElement" (lambda (self x) (with-vec self (vec-grow! self (fx+ 1 (vec-size self))) (vec-call self "add" x)) jolt-nil))
@@ -144,8 +147,10 @@
                          (if (and (fixnum? x) (not (jfloat? x)))
                              (begin (vec-index! self x) (vec-mod! self)
                                     (let ((old (al-ref (vec-al self) x))) (al-remove-at! (vec-al self) x) old))
+                             ;; remove(Object) is removeElement, which counts a change found or not
                              (let ((i (vec-index-from (al->list (vec-al self)) x 0 1)))
-                               (if (fx<? i 0) #f (begin (vec-mod! self) (al-remove-at! (vec-al self) i) #t)))))))
+                               (vec-mod! self)
+                               (if (fx<? i 0) #f (begin (al-remove-at! (vec-al self) i) #t)))))))
       (cons "elementAt" (lambda (self i)
                           (with-vec self
                             (let ((i (jnum->exact i)))
@@ -175,7 +180,8 @@
       (cons "removeElement" (lambda (self x)
                               (with-vec self
                                 (let ((i (vec-index-from (al->list (vec-al self)) x 0 1)))
-                                  (if (fx<? i 0) #f (begin (vec-mod! self) (al-remove-at! (vec-al self) i) #t))))))
+                                  (vec-mod! self)
+                                  (if (fx<? i 0) #f (begin (al-remove-at! (vec-al self) i) #t))))))
       (cons "removeAllElements" (lambda (self) (with-vec self (vec-call self "clear")) jolt-nil))
       (cons "indexOf" (case-lambda
                         ((self x) (with-vec self (->num (vec-index-from (al->list (vec-al self)) x 0 1))))
@@ -245,6 +251,8 @@
 (jx-class! "jx-vector" "java.util.Vector" '("java.util.AbstractList" "java.util.List" "java.util.RandomAccess" "java.lang.Cloneable" "java.io.Serializable"))
 (jx-class! "jx-stack" "java.util.Stack" '("java.util.Vector"))
 (register-host-methods! "jx-vector" vector-methods)
+(register-modcount! "jx-vector" vec-mod)
+(register-modcount! "jx-stack" vec-mod)
 (register-host-methods! "jx-stack" (append vector-methods stack-methods))
 (for-each (lambda (t) (jx-register! t 'ralist vec-list (lambda (v) (with-vec v (vec-size v))) #f #f))
           '("jx-vector" "jx-stack"))
@@ -2203,9 +2211,29 @@
   (let ((v (list->vector elems))) (make-spl cls 'vec v 0 (vector-length v) chars (if (pair? cmp) (car cmp) jolt-nil))))
 (define (make-iter-spl cls chars it est . cmp)
   (make-spl cls 'iter it 0 est chars (if (pair? cmp) (car cmp) jolt-nil)))
+;; A list that keeps a modCount (ArrayList, LinkedList, Vector) is walked live:
+;; kind live, src the list, lo the next index, hi its fence (-1 until first
+;; use) and slot 6 the count expected. Elements are read from the list as it
+;; stands, and the count is checked after each tryAdvance's action and once
+;; after a forEachRemaining, as ArrayListSpliterator / LLSpliterator /
+;; VectorSpliterator do. A LinkedList's splits off a batch as an
+;; ArraySpliterator; the others split at the midpoint.
+(define (spl-live-size l) (if (al-family? l) (al-cnt l) (jnum->exact (jx-call l "size" '()))))
+(define (spl-live-get l i) (if (al-family? l) (al-ref l i) (jx-call l "get" (list (->num i)))))
+(define (spl-live-check! x)
+  (let ((e (spl-ref x 6)))
+    (when (and e (not (eqv? e (jutil-modcount (spl-ref x 1))))) (jutil-cme!))))
+;; a live one's split batch size, in the comparator slot (a list has no comparator)
+(define (spl-batch x) (let ((b (spl-ref x 5))) (if (fixnum? b) b 0)))
+(define (spl-batch! x n) (spl-set! x 5 n))
+(define (make-live-spl cls chars l)
+  (let ((s (make-spl cls 'live l 0 -1 chars jolt-nil))) (spl-set! s 6 #f) s))
 (define (spl-force! x)
   ;; a late-binding one takes its elements at its first use, as the JDK's
   ;; collection spliterators bind to the source then rather than at creation
+  (when (and (eq? (spl-ref x 0) 'live) (fx<? (spl-ref x 3) 0))
+    (spl-set! x 3 (spl-live-size (spl-ref x 1)))
+    (spl-set! x 6 (jutil-modcount (spl-ref x 1))))
   (when (eq? (spl-ref x 0) 'lazy)
     (let ((v (list->vector ((spl-ref x 1)))))
       (spl-set! x 0 'vec) (spl-set! x 1 v) (spl-set! x 3 (vector-length v)))))
@@ -2215,6 +2243,11 @@
   (case (spl-ref x 0)
     ((vec) (let ((lo (spl-ref x 2)))
              (if (fx<? lo (spl-ref x 3)) (begin (spl-set! x 2 (fx+ lo 1)) (vector-ref (spl-ref x 1) lo)) spl-none)))
+    ((live) (let ((lo (spl-ref x 2)) (l (spl-ref x 1)))
+              ;; a list shrunk under the walk ends it (the count check reports it)
+              (if (and (fx<? lo (spl-ref x 3)) (fx<? lo (spl-live-size l)))
+                  (begin (spl-set! x 2 (fx+ lo 1)) (spl-live-get l lo))
+                  spl-none)))
     (else (let ((it (spl-ref x 1)))
             (if (jolt-truthy? (jx-call it "hasNext" '()))
                 (let ((v (jx-call it "next" '())))
@@ -2225,6 +2258,24 @@
 (define (spl-split! x)
   (spl-force! x)
   (case (spl-ref x 0)
+    ((live)
+     (let* ((lo (spl-ref x 2)) (hi (spl-ref x 3)) (l (spl-ref x 1)))
+       (if (string=? (spl-ref x 7) "java.util.LinkedList$LLSpliterator")
+           ;; LLSpliterator: a batch, 1024 more each time, as an ArraySpliterator
+           (let* ((b (spl-batch x)) (take (fxmin (fx+ b 1024) (fx- hi lo))))
+             (if (fx<=? take 0) jolt-nil
+                 (let loop ((j 0) (acc '()))
+                   (if (and (fx<? j take) (fx<? (fx+ lo j) (spl-live-size l)))
+                       (loop (fx+ j 1) (cons (spl-live-get l (fx+ lo j)) acc))
+                       (begin (spl-set! x 2 (fx+ lo j)) (spl-batch! x j)
+                              (make-vec-spl "java.util.Spliterators$ArraySpliterator" (fxior spl-ORDERED spl-SIZED spl-SUBSIZED)
+                                            (reverse acc)))))))
+           (let ((mid (fxsrl (fx+ lo hi) 1)))
+             (if (fx>=? lo mid) jolt-nil
+                 (let ((p (make-spl (spl-ref x 7) 'live l lo mid (spl-ref x 4) (spl-ref x 5))))
+                   (spl-set! p 6 (spl-ref x 6))
+                   (spl-set! x 2 mid)
+                   p))))))
     ((vec) (let* ((lo (spl-ref x 2)) (mid (fxsrl (fx+ lo (spl-ref x 3)) 1)))
              (if (fx>=? lo mid) jolt-nil
                  (begin (spl-set! x 2 mid)
@@ -2256,15 +2307,21 @@
 (define spliterator-methods
   (list (cons "tryAdvance" (lambda (self f)
                              (when (jolt-nil? f) (jx-npe))
-                             (let ((v (spl-advance! self))) (if (eq? v spl-none) #f (begin (jolt-fi-call f "accept" v) #t)))))
+                             (let ((v (spl-advance! self)))
+                               (if (eq? v spl-none) #f
+                                   (begin (jolt-fi-call f "accept" v)
+                                          (when (eq? (spl-ref self 0) 'live) (spl-live-check! self))
+                                          #t)))))
         (cons "forEachRemaining" (lambda (self f)
                                    (when (jolt-nil? f) (jx-npe))
                                    (let loop () (let ((v (spl-advance! self))) (unless (eq? v spl-none) (jolt-fi-call f "accept" v) (loop))))
+                                   (when (eq? (spl-ref self 0) 'live) (spl-live-check! self))
                                    jolt-nil))
         (cons "trySplit" (lambda (self) (spl-split! self)))
         (cons "estimateSize" (lambda (self)
                                (spl-force! self)
-                               (->num (cond ((not (eq? (spl-ref self 0) 'vec)) (spl-ref self 3))
+                               (->num (cond ((eq? (spl-ref self 0) 'live) (fx- (spl-ref self 3) (spl-ref self 2)))
+                                            ((not (eq? (spl-ref self 0) 'vec)) (spl-ref self 3))
                                             ((and (not (spl-sized? self)) (> (spl-ref self 6) 0)) (spl-ref self 6))
                                             (else (fx- (spl-ref self 3) (spl-ref self 2)))))))
         (cons "getExactSizeIfKnown" (lambda (self) (if (spl-sized? self) (jx-call self "estimateSize" '()) (->num -1))))
@@ -2297,10 +2354,9 @@
     (lambda (a b) (kc (jolt-nth a 0) (jolt-nth b 0)))))
 (for-each (lambda (r) (register-host-methods! (car r) (list (cons "spliterator" (cdr r)))))
   (list
-    (cons "arraylist" (spl-vec-of "java.util.ArrayList$ArrayListSpliterator" spl-OSS))
+    (cons "arraylist" (lambda (self) (make-live-spl "java.util.ArrayList$ArrayListSpliterator" spl-OSS self)))
     (cons "cd-arraylist-sublist" (spl-vec-of "java.util.ArrayList$SubList$2" spl-OSS))
-    (cons "linkedlist" (spl-iter-of "java.util.LinkedList$LLSpliterator" spl-OSS))
-    (cons "arraydeque" (spl-vec-of "java.util.ArrayDeque$DeqSpliterator" (fxior spl-OSS spl-NONNULL)))
+    (cons "linkedlist" (lambda (self) (make-live-spl "java.util.LinkedList$LLSpliterator" spl-OSS self)))
     (cons "hashset" (spl-vec-of "java.util.HashMap$KeySpliterator" (fxior spl-SIZED spl-DISTINCT)))
     (cons "jx-hm-keyset" (spl-vec-of "java.util.HashMap$KeySpliterator" (fxior spl-SIZED spl-DISTINCT)))
     (cons "jx-chm-keyset" (spl-vec-of "java.util.concurrent.ConcurrentHashMap$KeySpliterator" (fxior spl-DISTINCT spl-NONNULL spl-CONCURRENT)))
@@ -2346,8 +2402,8 @@
                                                           (fxior spl-DISTINCT spl-SORTED spl-ORDERED spl-NONNULL spl-CONCURRENT)
                                                           (jxc-elems self) (spl-entry-cmp (tmr-cmp-obj (cs-root self))))))
     (cons "jx-priority-queue" (spl-vec-of "java.util.PriorityQueue$PriorityQueueSpliterator" (fxior spl-SIZED spl-SUBSIZED spl-NONNULL)))
-    (cons "jx-vector" (spl-vec-of "java.util.Vector$VectorSpliterator" spl-OSS))
-    (cons "jx-stack" (spl-vec-of "java.util.Vector$VectorSpliterator" spl-OSS))))
+    (cons "jx-vector" (lambda (self) (make-live-spl "java.util.Vector$VectorSpliterator" spl-OSS self)))
+    (cons "jx-stack" (lambda (self) (make-live-spl "java.util.Vector$VectorSpliterator" spl-OSS self)))))
 ;; the unmodifiable and synchronized wrappers hand back the collection's own
 (define (spl-of-inner self) (jx-call (jxw-inner self) "spliterator" '()))
 (for-each (lambda (f)

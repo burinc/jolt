@@ -72,8 +72,8 @@
 ;; Version 12: a host collection shim travels as an image-hosted record (its
 ;; codec's kind and plain data, host-static.ss register-image-codec!) and an
 ;; enum constant as its class and name; formats 11 and older carry neither.
-(define jolt-image-format-version 13)
-(define jolt-image-read-versions '(2 3 4 5 6 7 8 9 10 11 12 13))
+(define jolt-image-format-version 14)
+(define jolt-image-read-versions '(2 3 4 5 6 7 8 9 10 11 12 13 14))
 
 ;; --- classification -----------------------------------------------------------
 ;; An eq hashtable is the ONE hashtable kind Chez can fasl; eqv/equal/string-hash
@@ -2292,6 +2292,13 @@
                        (apply jolt-vector (map image-stub-info stubs)))
         jolt-nil)))
 
+;; Format 14 changes no framing: it is the format in which an ArrayDeque travels
+;; as its ring buffer #(elements head tail #f) rather than the list layout
+;; #(backing count head), and an ArrayList / LinkedList carries its modCount as a
+;; fourth slot. Both older layouts still read (java/array-deque.ss converts an
+;; old deque on first use; host-static-classes.ss reads a 3-slot list as count
+;; 0); a jolt that knows only 13 refuses a 14 rather than misread a deque.
+;;
 ;; Format 13 names the defrecord and deftype types an image holds instances of.
 ;; An instance travels with its descriptor, but whether its type was a record —
 ;; what record?, map?, keys and printing ask — lives in tables defrecord and

@@ -232,6 +232,17 @@
 ;; class (classes follow tags); register-jutil-iterator! declares one.
 ;; State: #(remaining last remove! project)
 (define jutil-iterator-none (list 'none))
+;; ---- modCount ----------------------------------------------------------------
+;; The lists that count structural changes (ArrayList, LinkedList, Vector)
+;; register how to read the count, so the code they share — subList, the
+;; spliterators, a stream's source — can watch any of them the same way.
+;; jutil-modcount answers the count, or #f for a list that keeps none.
+(define jutil-modcount-tbl (make-hashtable string-hash string=?))
+(define (register-modcount! tag f) (hashtable-set! jutil-modcount-tbl tag f))
+(define (jutil-modcount x)
+  (and (jhost? x) (let ((f (hashtable-ref jutil-modcount-tbl (jhost-tag x) #f))) (and f (f x)))))
+(define (jutil-cme!) (throw-jvm 'ConcurrentModificationException jolt-nil))
+
 (define (make-jutil-iterator tag items remove! . project)
   (make-jhost tag (vector items jutil-iterator-none remove!
                           (if (pair? project) (car project) (lambda (x) x)))))
