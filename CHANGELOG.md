@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`ArrayDeque` is a ring buffer, as the JDK's is**: both ends O(1), the
+  same capacities and growth, nulls refused, and the full `Deque` surface
+  (`pollFirst`, `peekLast`, `removeLastOccurrence`, `descendingIterator`, …).
+- **A stream pipeline's `spliterator()`** is the JDK's `WrappingSpliterator`,
+  with the source's characteristics edited by each operation as the JDK's
+  flags edit them; `Stream/of` and `Arrays/stream` hand back an
+  `ArraySpliterator`.
+- **`make failfastmodel`**: `tools/failfast-model.pl` checks the fail-fast
+  iteration protocol and the deque's ring buffer, with nine broken versions
+  that must be caught.
 - **`java.util.Spliterator`.** Every collection answers `spliterator()` with
   the JDK's class, characteristics, size and comparator: array-backed ones split
   at the midpoint, iterator-backed ones by batches, and `spliteratorUnknownSize`
@@ -106,6 +116,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **List and deque iterators fail fast.** `ArrayList`, `LinkedList` and
+  `Vector` keep a modCount, and their iterators, `listIterator`, `forEach`,
+  `removeIf`, `subList`, spliterators and streams raise
+  `ConcurrentModificationException` where the JDK does. Iterators are live:
+  a `set` during iteration shows. `ArrayDeque`'s behaviour follows its ring
+  buffer, as the JDK's does.
+- **`WeakHashMap` and `IdentityHashMap` are their own classes**: a
+  `WeakHashMap` drops an entry whose key nothing else holds, and an
+  `IdentityHashMap` matches keys and values by reference.
+- **java.base's interfaces are known**, so a proxy over a JDK class jolt does
+  not model (`java.util.TimerTask`) extends it, and `isInterface` answers for
+  every java.base type.
+- **Images are format 14**: an `ArrayDeque` travels as its ring buffer and a
+  list carries its modCount; older images still read.
 - **A HashMap's `keySet`, `values` and `entrySet` are live views**
   (`HashMap$KeySet` / `$Values` / `$EntrySet`): removing through one removes
   from the map, a later put shows through, an entry's `setValue` writes the map
@@ -154,6 +178,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `(String. s)` returned `s` itself; it is a new string, and `(String.)` is
+  `""`.
+- The per-thread string hash cache held up to 2048 strings strongly; it is
+  weak now.
+- `Vector.addAll` handed the list code a raw list and threw.
+- `jch-register-supers!` left the derived name tables stale; a new reify or
+  proxy class no longer flushes the class graph's dispatch caches.
 - `get` on a reify calls the 1-arity `valAt` for `(get r k)` and reads a
   `java.util.Map` reify through its `get`; `ex-message` and `str` of a proxy
   over an Exception carry its (possibly overridden) message.
