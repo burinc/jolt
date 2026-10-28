@@ -318,7 +318,16 @@
 (define (jch-mark-interface! name)
   (unless (or (string=? name "java.lang.Object") (string=? name "Object"))
     (jolt-with-mutex jch-cache-mutex (hashtable-set! jch-interface-set name #t))))
-(define (jch-interface? name) (hashtable-ref jch-interface-set name #f))
+;; an interface the graph marked, or one of java.base's (jdk-interfaces.ss)
+(define (jch-interface? name)
+  (or (hashtable-ref jch-interface-set name #f) (hashtable-ref jdk-public-interfaces name #f)))
+;; a java.* / javax.* name that is not an interface: a JDK class, whether or not
+;; the graph models it (a proxy over java.util.TimerTask extends it)
+(define (jch-jdk-class? name)
+  (and (string? name)
+       (or (and (fx>? (string-length name) 5) (string=? (substring name 0 5) "java."))
+           (and (fx>? (string-length name) 6) (string=? (substring name 0 6) "javax.")))
+       (not (jch-interface? name))))
 (for-each jch-mark-interface!
           '("clojure.lang.Seqable" "clojure.lang.Sequential" "clojure.lang.Sorted"
             "clojure.lang.Reversible" "clojure.lang.Indexed" "clojure.lang.Counted"

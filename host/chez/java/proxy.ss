@@ -88,7 +88,7 @@
   (and (pair? names)
        (or (and (reify-delegate p) #t)
            (let ((f (proxy-fqn (car names))))
-             (and (not (jch-interface? f)) (pair? (jch-direct-supers f)))))))
+             (and (not (jch-interface? f)) (or (pair? (jch-direct-supers f)) (jch-jdk-class? f)))))))
 (define (proxy-class-name ns names class?)
   (let ((key (cons ns names)))
     (or (hashtable-ref proxy-class-names key #f)

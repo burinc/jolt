@@ -2926,6 +2926,7 @@
 ;; the single JVM class/interface graph — value-host-tags, instance?, isa?/supers,
 ;; and the exception hierarchy all derive from it. Before records.ss so
 ;; value-host-tags can build on jch-tags.
+(load "host/chez/java/jdk-interfaces.ss")   ; java.base's public interfaces (generated)
 (load "host/chez/java/class-hierarchy.ss")
 
 ;; records + protocols: defrecord/deftype/defprotocol/
