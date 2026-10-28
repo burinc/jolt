@@ -122,6 +122,8 @@
     (check "encoded URL" (str url)
            "jar:file:jolt-embedded-resources.jar!/encoded/001%20my%20caf%c3%a9%3bv%3d1.sql")
     (check "encoded URL content" (slurp url) "encoded\n")
+    (check "URL rebuilt from its text" (slurp (java.net.URL. (str url))) "encoded\n")
+    (check "URL text as a source" (slurp (str url)) "encoded\n")
     (check "encoded URL entry" (.getEntryName (.openConnection url)) name)
     (check "encoded URL URI" (str (.toURI url))
            "jar:file:jolt-embedded-resources.jar!/encoded/001%20my%20caf%c3%a9%3bv%3d1.sql")

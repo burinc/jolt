@@ -506,13 +506,23 @@
               (values #f #f)
               (let ((ent (hashtable-ref (zipdir-table d) (uri-decode-lenient (cdr parts)) #f)))
                 (if ent (values d ent) (values #f #f))))))))
+;; A jar path into the image's own archive ("jar:file:jolt-embedded-resources.jar
+;; !/name", the URL io/resource hands out in a built binary) names an embedded
+;; resource, not a file: its resource URL, or #f.
+(define (embedded-jar-path-res p)
+  (let ((parts (jar-path-split p)))
+    (and parts
+         (string=? (car parts) embedded-archive-name)
+         (embedded-resource-url (embedded-percent-decode (cdr parts))))))
 (define (jar-path-exists? p)
-  (let-values (((d ent) (jar-path-entry p))) (and ent #t)))
+  (or (and (embedded-jar-path-res p) #t)
+      (let-values (((d ent) (jar-path-entry p))) (and ent #t))))
 ;; The entry's bytes, or #f when the path names no entry. A damaged entry raises
 ;; the ZipException the read finds, with the path in it.
 (define (jar-path-bytes p)
   (let-values (((d ent) (jar-path-entry p)))
-    (and ent
+    (if (not ent)
+        (let ((r (embedded-jar-path-res p))) (and r (embedded-res-bytes r)))
          (guard (e ((jolt-throw-condition? e)
                     (let ((v (jolt-throw-condition-value e)))
                       (if (ex-info-map? v)
@@ -1811,7 +1821,10 @@
            (file (jolt-str-render-one (caddr args))))
        (make-url (url-canonical (string-append proto "://" host file)))))
     ((= (length args) 1)
-     (make-url (url-canonical (jolt-str-render-one (car args)))))
+     (let ((spec (jolt-str-render-one (car args))))
+       ;; a URL into the image's own archive is the resource it names
+       (or (embedded-jar-path-res spec)
+           (make-url (url-canonical spec)))))
     ;; (URL. context spec [handler])
     (else
      (let* ((context (car args))
@@ -1866,7 +1879,10 @@
 ;; opens it; a path with no such entry is java.io.FileNotFoundException.
 (define (jar-path-stream p)
   (let-values (((d ent) (jar-path-entry p)))
-    (if ent (zipdir-entry-stream-owned d ent) (jar-path-missing p))))
+    (cond (ent (zipdir-entry-stream-owned d ent))
+          ((embedded-jar-path-res p)
+           => (lambda (r) (make-in-stream (open-bytevector-input-port (embedded-res-bytes r)))))
+          (else (jar-path-missing p)))))
 ;; The handler's own openConnection. Without one there is nothing to connect
 ;; through — say so rather than returning something that reads as empty.
 (define (url-open-connection u)
