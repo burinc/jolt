@@ -121,6 +121,8 @@
 (register-deref-print! jolt-atom? (lambda (a) (cons "ready" (jolt-atom-val a))))
 ;; inside a transaction a ref prints its in-transaction value
 (register-deref-print! jolt-ref? (lambda (r) (cons "ready" (txn-read r))))
+;; reduced's box is a clojure.lang.Reduced, an IDeref like the rest
+(register-deref-print! jolt-reduced? (lambda (r) (cons "ready" (jolt-reduced-val r))))
 
 ;; A user's (defmethod print-method T …) IS the printer for T, as on the JVM — it
 ;; outranks every built-in rendering, including an arm a library registered for
