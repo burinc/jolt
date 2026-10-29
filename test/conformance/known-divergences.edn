@@ -1704,6 +1704,14 @@
            :jolt "[1 3 5 17 100 2]"}
    :note "A weak table cannot keep its keys in an insertion list without holding them, so the order comes from the hashes; it is the same whatever the table's history. The JDK's order is unspecified by the Map contract."}
   {:category :host-model
+   :behavior "the identity of a HashMap's entries across two walks"
+   :jvm "the same HashMap$Node each time: the node is the table's storage"
+   :jolt "a fresh HashMap$Node per walk, equal to the last and reading the same live value"
+   :check {:expr "(let [m (java.util.HashMap. {1 2})] [(identical? (first (seq m)) (first (seq m))) (= (first (seq m)) (first (seq m)))])"
+           :jvm "[true true]"
+           :jolt "[false true]"}
+   :note "jolt's HashMap stores keys and values in a Chez hashtable, not in Node objects, so an entry is made when a walk reaches it. It is live (getValue and setValue go to the map) and equal and hash-equal to any other entry for the key, so only identical? sees the difference. IdentityHashMap, WeakHashMap, ConcurrentHashMap and Properties entries are made the same way."}
+  {:category :host-model
    :behavior "a ConcurrentHashMap write, from inside computeIfAbsent's function, to another key in the computed key's bin"
    :jvm "IllegalStateException \"Recursive update\" when the two keys share a bin of the table at its current capacity"
    :jolt "the write goes through; only the computed key itself is refused"

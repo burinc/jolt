@@ -1681,9 +1681,13 @@
 ;; printed [..]; a LinkedList a List, printed (..); an ArrayDeque only a
 ;; Collection, which keeps the identity equals/hashCode registered above and
 ;; prints as #object over its toString.
+;; A Map seqs through its entrySet's iterator on the JVM (RT.seq), so seq, =,
+;; hash and print see the map's own live entries (HashMap$Node,
+;; ConcurrentHashMap$MapEntry ...), as a LinkedHashMap's already are, not
+;; detached MapEntry pairs (jolt-12zv0). The entrySet views (jutil-concurrent.ss)
+;; build them from the key order, never back through here.
 (define (hm-entries self)
-  (map (lambda (k) (make-map-entry k (hashtable-ref (hm-tbl self) k jolt-nil)))
-       (hm-keys-ordered self)))
+  (jutil-coll-elems (record-method-dispatch self "entrySet" jolt-nil)))
 (register-jutil-coll! "hashmap" 'map hm-entries)
 (register-jutil-coll! "chm" 'map hm-entries)
 (register-jutil-coll! "jx-weak-hashmap" 'map hm-entries)
@@ -3897,8 +3901,9 @@
              (if (and (jolt-transient? val) (eq? 'set (jolt-transient-kind val))) #t 'pass))
             (else 'pass)))
         'pass)))
-;; (seq a-HashMap) walks its entries, like RT.seqFrom over a java.util.Map.
-(register-seq-arm! hm-hashmap? (lambda (x) (jutil-ff-seq x (seq->list (jolt-seq (hm->pmap x))))))
+;; (seq a-HashMap) walks its entrySet, like RT.seqFrom over a java.util.Map: the
+;; map's own entries in the map's own order (hm-entries)
+(register-seq-arm! hm-hashmap? (lambda (x) (jutil-ff-seq x (hm-entries x))))
 ;; Which shims are Iterable (seqable?) is the java.util registry's answer
 ;; (jutil-colls.ss jhost-seqable-shim?): every shim above registers there.
 ;; a MapEntry does not carry meta on the JVM (AMapEntry); deny IObj/IMeta so the
