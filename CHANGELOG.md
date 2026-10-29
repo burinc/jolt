@@ -210,6 +210,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `java.io.File` whose path holds a NUL no longer acts on another file.**
+  The OS reads a path only up to a NUL, so `(.delete (File. "notes.txt\u0000x"))`
+  deleted `notes.txt`, and `exists`, `length`, `list` and the rest answered
+  for it. They now give the JDK's answers for an invalid path (false, 0, nil),
+  and `createNewFile`, `slurp`, `spit` and the file streams raise "Invalid file
+  path". `Paths/get` still accepts one (jolt-jg8tx).
 - **`HashMap` and `HashSet` `remove` is O(1)** (jolt-lfm8p). It rebuilt the
   map's insertion-order key list, so one removal from a 20k-entry map cost
   ~112us; it now leaves a stale entry the walk skips, and the list is rebuilt
