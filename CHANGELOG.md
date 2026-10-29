@@ -235,6 +235,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   read, so a value that allocates (a vector, a nested map) became a new object
   per read, and per loop iteration: `(identical? (:x m) (:x m))` was false.
   Such a value is now bound once where the struct was.
+- **`jolt nrepl-server` says when it can't write its port file**, e.g. a
+  `--port-file` into a missing directory. It used to start as if the file had
+  been written, leaving the editor nothing to find.
 - **`HashMap` and `HashSet` `remove` is O(1)** (jolt-lfm8p). It rebuilt the
   map's insertion-order key list, so one removal from a 20k-entry map cost
   ~112us; it now leaves a stale entry the walk skips, and the list is rebuilt
