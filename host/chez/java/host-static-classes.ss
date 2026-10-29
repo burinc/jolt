@@ -967,6 +967,21 @@
        (if (and (not jolt-mt?) (chm-claims-mine? st))
            (begin e ...)
            (jolt-call-with-monitor (vector-ref st 4) (lambda () e ...)))))))
+;; A Properties is synchronized on itself, as the JDK's writes are: slot 5 holds
+;; its own monitor, so (locking props ...) excludes its methods. The same
+;; single-threaded shortcut as with-chm, unless this thread holds the monitor
+;; already (a locking block around the call) and so must enter it again.
+(define (props-state tbl ord defaults writethrough)
+  (vector tbl ord 0 defaults writethrough #f))
+(define (props-own-monitor! self) (vector-set! (jhost-state self) 5 (object-monitor self)) self)
+(define (hm-props? self) (string=? (jhost-tag self) "properties"))
+(define-syntax with-props
+  (syntax-rules ()
+    ((_ self e ...)
+     (let ((m (vector-ref (jhost-state self) 5)))
+       (if (and (not jolt-mt?) (not (vector-ref m monitor-i-owner)))
+           (begin e ...)
+           (jolt-call-with-monitor m (lambda () e ...)))))))
 (define (chm-claims-mine? st)
   (let ((cs (vector-ref st 3)))
     (or (null? cs)
@@ -1040,14 +1055,18 @@
   (hm-bump! self)
   (hashtable-clear! (hm-tbl self))
   (hm-ord! self (if (hm-weak? self) (list 'v) '())))
-;; A ConcurrentHashMap's walks take the order and the values under its monitor,
-;; so a walk racing a write sees each key with the value it had, never a key
-;; whose value a remove already took.
+;; A ConcurrentHashMap's and a Properties' walks take the order and the values
+;; under the map's lock, so a walk racing a write sees each key with the value it
+;; had, never a key whose value a remove already took.
 (define (hm-keys-ordered self)
-  (if (hm-chm? self) (with-chm self (hm-keys-ordered* self)) (hm-keys-ordered* self)))
+  (cond ((hm-chm? self) (with-chm self (hm-keys-ordered* self)))
+        ((hm-props? self) (with-props self (hm-keys-ordered* self)))
+        (else (hm-keys-ordered* self))))
 (define (hm-pairs-ordered self)          ; ((k . v) ...) in the map's order
   (define (pairs) (let ((t (hm-tbl self))) (map (lambda (k) (cons k (hashtable-ref t k jolt-nil))) (hm-keys-ordered* self))))
-  (if (hm-chm? self) (with-chm self (pairs)) (pairs)))
+  (cond ((hm-chm? self) (with-chm self (pairs)))
+        ((hm-props? self) (with-props self (pairs)))
+        (else (pairs))))
 (define (hm-keys-ordered* self)
   (if (hm-weak? self)
       ;; by hash: the same keys come out in the same order whatever the
@@ -1246,10 +1265,10 @@
 ;; as a key lookup and so read nil for every system property — how a library that
 ;; reads them through the Properties API saw nothing.
 (define (make-properties-jhost . defaults)
-  (make-jhost "properties"
-              (vector (make-hashtable hm-hash jolt=2) (quote ()) 0
-                      (if (pair? defaults) (car defaults) #f)
-                      #f)))
+  (props-own-monitor!
+    (make-jhost "properties"
+                (props-state (make-hashtable hm-hash jolt=2) (quote ())
+                             (if (pair? defaults) (car defaults) #f) #f))))
 (define (props-slot self i)
   (let ((st (jhost-state self)))
     (and (fx>? (vector-length st) i) (vector-ref st i))))
@@ -1285,8 +1304,10 @@
   (hm-note-key! self k)
   (hashtable-set! (hm-tbl self) k v)
   (let ((wt (props-writethrough self)))
-    (when wt (hashtable-set! wt k (if (string? v) v (jolt-str-render-one v))))))
-(register-host-methods! "properties"
+    (when wt (jolt-with-mutex sys-prop-mu (hashtable-set! wt k (if (string? v) v (jolt-str-render-one v)))))))
+;; the System properties' writethrough table (host-static-methods.ss) is shared
+;; with System/setProperty, so its writes take that table's mutex
+(define props-methods
   (append
     hashmap-methods
     (list
@@ -1309,7 +1330,7 @@
                                          (hashtable-delete! (hm-tbl self) k)
                                          (hm-drop-key! self k))
                                        (let ((wt (props-writethrough self)))
-                                         (when wt (hashtable-delete! wt k)))
+                                         (when wt (jolt-with-mutex sys-prop-mu (hashtable-delete! wt k))))
                                        old))
                                     ;; remove(key, value): only when mapped to exactly that
                                     ((self k v)
@@ -1320,14 +1341,36 @@
       (cons "clear" (lambda (self)
                       (hm-clear! self)
                       (let ((wt (props-writethrough self)))
-                        (when wt (hashtable-clear! wt)))
+                        (when wt (jolt-with-mutex sys-prop-mu (hashtable-clear! wt))))
                       jolt-nil))
       ;; the two enumerations that DO span the defaults chain.
       (cons "stringPropertyNames"
             (lambda (self) (apply jolt-hash-set
                              (filter (lambda (k) (string? (props-string-ref self k #f)))
                                      (props-names self)))))
-      (cons "propertyNames" (lambda (self) (list->cseq (props-names self)))))))
+      (cons "propertyNames" (lambda (self) (list->cseq (props-names self))))
+      (cons "clone" (lambda (self)
+                      (let ((c (if (props-defaults self) (make-properties-jhost (props-defaults self)) (make-properties-jhost))))
+                        (hm-copy-into-ordered! c self)
+                        c))))))
+;; The JDK's Properties synchronizes every write and forEach on the object (a
+;; compute function runs under it there too); reads go to its table unlocked.
+(define props-synchronized
+  '("put" "putIfAbsent" "setProperty" "remove" "clear" "putAll" "replace" "replaceAll"
+    "merge" "compute" "computeIfAbsent" "computeIfPresent" "forEach"))
+(define (props-locked proc)
+  (make-arity-wrapper-procedure
+    (case-lambda
+      ((self) (with-props self (proc self)))
+      ((self a) (with-props self (proc self a)))
+      ((self a b) (with-props self (proc self a b)))
+      ((self a b c) (with-props self (proc self a b c)))
+      ((self . r) (with-props self (apply proc self r))))
+    (procedure-arity-mask proc)
+    #f))
+(register-host-methods! "properties"
+  (map (lambda (m) (if (member (car m) props-synchronized) (cons (car m) (props-locked (cdr m))) m))
+       props-methods))
 (register-class-ctor! "Properties"
   (lambda args (apply make-properties-jhost args)))
 (register-class-ctor! "java.util.Properties"
@@ -1336,8 +1379,8 @@
 ;; recomputed per call so user.dir and java.class.path stay current, with writes
 ;; going through to the override store.
 (define (make-system-properties m override-tbl)
-  (let ((self (make-jhost "properties"
-                          (vector (make-hashtable hm-hash jolt=2) (quote ()) 0 #f override-tbl))))
+  (let ((self (props-own-monitor!
+                (make-jhost "properties" (props-state (make-hashtable hm-hash jolt=2) (quote ()) #f override-tbl)))))
     (for-each (lambda (e)
                 (hm-note-key! self (jolt-nth e 0))
                 (hashtable-set! (hm-tbl self) (jolt-nth e 0) (jolt-nth e 1)))

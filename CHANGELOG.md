@@ -228,6 +228,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `putAll`, `merge`, `getOrDefault`, the compute family and the copy
   constructor throw `NullPointerException` instead of storing or ignoring it.
   `mappingCount` is there.
+- **`Properties` is synchronized, as the JDK's is.** Writes and `forEach`
+  hold the object's own monitor (so `locking` it excludes them) and walks see
+  each key with its value; concurrent `setProperty` lost entries, and writes
+  through `System/getProperties` could corrupt the system property table.
+  `clone` keeps the defaults. Single-threaded speed is unchanged.
 - **`Properties.remove(key, value)`** was missing; it removes the key only
   when it is mapped to that value.
 - **`ArrayDeque.addAll`** of the deque itself throws

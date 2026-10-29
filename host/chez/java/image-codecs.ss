@@ -25,8 +25,8 @@
             (codec-kvs (hm-pairs-ordered m))))
   (lambda (h)
     (if (string=? (vector-ref h 0) "properties")
-        (make-jhost "properties" (vector (make-hashtable hm-hash jolt=2) '() 0
-                                         (if (jolt-nil? (vector-ref h 1)) #f (vector-ref h 1)) #f))
+        (props-own-monitor! (make-jhost "properties" (props-state (make-hashtable hm-hash jolt=2) '()
+                                                                  (if (jolt-nil? (vector-ref h 1)) #f (vector-ref h 1)) #f)))
         ;; each map's own kind of table: weak keys, identity keys, or equality
         (let ((tag (vector-ref h 0)))
           (cond ((string=? tag "jx-weak-hashmap") (make-jhost tag (hm-state (make-weak-hashtable hm-hash jolt=2) (list 'v))))
