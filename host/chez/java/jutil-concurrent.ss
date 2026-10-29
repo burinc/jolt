@@ -1583,13 +1583,14 @@
         (lambda (self . args)
           (cs-check-args! name args)
           (cs-out (if (member name cs-writers)
-                      (jolt-call-with-monitor (vector-ref (cs-root self) 3) (lambda () (apply proc (cs-base self) args)))
+                      (jolt-call-with-monitor (vector-ref (cs-root self) 4) (lambda () (apply proc (cs-base self) args)))
                       (apply proc (cs-base self) args)))))))
 (define (cs-new-root cmp)
-  (let ((r (tm-make-root cmp))) (vector (vector-ref r 0) (vector-ref r 1) (vector-ref r 2) (make-monitor))))
+  ;; a TreeMap root with the lock in a fifth slot (tmr-concurrent?)
+  (let ((r (tm-make-root cmp))) (vector (vector-ref r 0) (vector-ref r 1) (vector-ref r 2) 0 (make-monitor))))
 (define (make-cs tag root) (make-jhost tag (vector root tm-unbounded #f tm-unbounded #f #f #f)))
 (define (cs-clone x) ; the same persistent tree under a root of its own
-  (let ((r (cs-root x))) (make-cs (jhost-tag x) (vector (tmr-sm r) (tmr-cmp-obj r) (tmr-cmpf r) (make-monitor)))))
+  (let ((r (cs-root x))) (make-cs (jhost-tag x) (vector (tmr-sm r) (tmr-cmp-obj r) (tmr-cmpf r) 0 (make-monitor)))))
 (for-each
   (lambda (r)
     (let ((base (car r)) (tag (cadr r)) (kind (cadddr r)))
@@ -1636,7 +1637,7 @@
             "ConcurrentSkipListMap$SubMap$SubMapEntryIterator" "ConcurrentSkipListMap$SubMap$SubMapKeyIterator"
             "ConcurrentSkipListMap$SubMap$SubMapValueIterator"))
 (set! tm-publish-fence (lambda () (memory-order-release)))
-(set! tm-root-write (lambda (r thunk) (jolt-call-with-monitor (vector-ref r 3) thunk)))
+(set! tm-root-write (lambda (r thunk) (jolt-call-with-monitor (vector-ref r 4) thunk)))
 (set! tm-foreign-view (lambda (x) (and (jhost? x) (hashtable-ref cs-to-base (jhost-tag x) #f) (cs-base x))))
 (define (cs-sorted-comparator x) (if (or (jx-isa? x "java.util.SortedMap") (jx-isa? x "java.util.SortedSet")) (jx-call x "comparator" '()) #f))
 (register-class-ctor! "java.util.concurrent.ConcurrentSkipListMap"
@@ -1834,11 +1835,13 @@
   (let ((kv (hmv-entry-kv e)))
     (and kv (hashtable-contains? (hm-tbl m) (car kv)) (hm-veq? m (cdr kv) (hmv-ref m (car kv))) #t)))
 (define (hmv-remove-key! m k) (jx-call m "remove" (list k)))
+;; HashMap$HashIterator: the key order is the walk, slot 4 the modCount it
+;; expects; next checks it before the end, remove after the IllegalStateException
 (define (hmv-iterator kind tag)
-  (lambda (self) (let ((m (hmv-map self))) (make-jhost tag (vector m (hm-keys-ordered m) jutil-iterator-none kind (hm-ord m))))))
+  (lambda (self) (let ((m (hmv-map self))) (make-jhost tag (vector m (hm-keys-ordered m) jutil-iterator-none kind (hm-mc m))))))
 (define (hmi-comod! it)
   (let ((st (jhost-state it)))
-    (unless (eq? (vector-ref st 4) (hm-ord (vector-ref st 0))) (throw-jvm 'ConcurrentModificationException jolt-nil))))
+    (unless (fx=? (vector-ref st 4) (hm-mc (vector-ref st 0))) (jutil-cme!))))
 (define hm-iterator-methods
   (list (cons "hasNext" (lambda (self) (pair? (vector-ref (jhost-state self) 1))))
         (cons "next" (lambda (self)
@@ -1854,7 +1857,7 @@
                            (hmi-comod! self)
                            (hmv-remove-key! (vector-ref st 0) (vector-ref st 2))
                            (vector-set! st 2 jutil-iterator-none)
-                           (vector-set! st 4 (hm-ord (vector-ref st 0)))
+                           (vector-set! st 4 (hm-mc (vector-ref st 0)))
                            jolt-nil)))
         (cons "forEachRemaining" (lambda (self f)
                                    (let loop () (when (pair? (vector-ref (jhost-state self) 1))
@@ -1885,12 +1888,14 @@
         (cons "add" (lambda (self x) (jx-uoe)))
         (cons "addAll" (lambda (self c) (jx-uoe)))
         (cons "toArray" (jxc-to-array (hmv-elems kind)))
-        ;; HashMap's view forEach checks for a structural change once the walk ends
+        ;; HashMap's view forEach walks the table and checks for a structural
+        ;; change once the walk ends; WeakHashMap's and IdentityHashMap's keep
+        ;; Iterable's, over the fail-fast iterator
         (cons "forEach" (lambda (self f)
-                          (let ((ord (hm-ord (hmv-map self))))
-                            (for-each (lambda (x) (jolt-fi-call f "accept" x)) ((hmv-elems kind) self))
-                            (unless (eq? ord (hm-ord (hmv-map self))) (throw-jvm 'ConcurrentModificationException jolt-nil))
-                            jolt-nil)))))
+                          (let ((m (hmv-map self)))
+                            (if (eq? (hm-ff-kind m) 'end)
+                                (hm-walk m (lambda (k v) (jolt-fi-call f "accept" (hmv-project kind m k))))
+                                (jutil-walk-for-each (jx-call self "iterator" '()) f)))))))
 (define (hmv-has-value? m v) (exists (lambda (k) (hm-veq? m v (hmv-ref m k))) (hm-keys-ordered m)))
 (for-each
   (lambda (f)
@@ -1913,7 +1918,10 @@
         (hmv-common 'entry (t "-entry-itr") hmv-has-entry?
                     (lambda (m e) (if (hmv-has-entry? m e) (begin (hmv-remove-key! m (car (hmv-entry-kv e))) #t) #f))))
       (jx-register! (t "-entryset") 'entries (hmv-elems 'entry) (lambda (v) (hashtable-size (hm-tbl (hmv-map v))))
-                    (lambda (v e) (hmv-has-entry? (hmv-map v) e)) #f)))
+                    (lambda (v e) (hmv-has-entry? (hmv-map v) e)) #f)
+      ;; a view's modCount is its map's
+      (for-each (lambda (sfx) (register-modcount! (t sfx) (lambda (v) (hm-mc (hmv-map v)))))
+                '("-keyset" "-values" "-entryset"))))
   hm-families)
 ;; IdentityHashMap compares by reference wherever the JDK's uses ==: replace's
 ;; old value, and equals, which holds a map whose mappings are the same objects
@@ -2312,8 +2320,15 @@
 (define (spl-ref x i) (vector-ref (jhost-state x) i))
 (define (spl-set! x i v) (vector-set! (jhost-state x) i v))
 (define (spl-sized? x) (not (fx=? 0 (fxand (spl-ref x 4) spl-SIZED))))
+;; slots 8 and 9: the collection a late-binding snapshot watches and the
+;; modCount it expects (#f for none): a HashMap's or TreeMap's spliterator takes
+;; the count when it binds, checks it after each tryAdvance's action and once
+;; after forEachRemaining, as theirs do
 (define (make-spl cls kind src lo hi chars cmp)
-  (make-jhost (hashtable-ref spl-tag-of cls #f) (vector kind src lo hi chars cmp 0 cls)))
+  (make-jhost (hashtable-ref spl-tag-of cls #f) (vector kind src lo hi chars cmp 0 cls #f #f)))
+(define (spl-watch-check! x)
+  (let ((c (spl-ref x 8)))
+    (when (and c (not (eqv? (spl-ref x 9) (jutil-modcount c)))) (jutil-cme!))))
 (define (make-vec-spl cls chars elems . cmp)
   (let ((v (list->vector elems))) (make-spl cls 'vec v 0 (vector-length v) chars (if (pair? cmp) (car cmp) jolt-nil))))
 (define (make-iter-spl cls chars it est . cmp)
@@ -2342,8 +2357,14 @@
     (spl-set! x 3 (spl-live-size (spl-ref x 1)))
     (spl-set! x 6 (jutil-modcount (spl-ref x 1))))
   (when (eq? (spl-ref x 0) 'lazy)
+    (let ((c (spl-ref x 8)))
+      (when c (spl-set! x 9 (jutil-modcount c))))
     (let ((v (list->vector ((spl-ref x 1)))))
-      (spl-set! x 0 'vec) (spl-set! x 1 v) (spl-set! x 3 (vector-length v)))))
+      (spl-set! x 0 'vec) (spl-set! x 1 v) (spl-set! x 3 (vector-length v))))
+  ;; an IteratorSpliterator over a collection makes its iterator at first use
+  (when (eq? (spl-ref x 0) 'iterc)
+    (let ((c (spl-ref x 1)))
+      (spl-set! x 0 'iter) (spl-set! x 1 (spl-it c)) (spl-set! x 3 (spl-n c)))))
 (define (spl-advance! x)
   ;; the next element, or the spl-none marker
   (spl-force! x)
@@ -2391,7 +2412,10 @@
     ((vec) (let* ((lo (spl-ref x 2)) (mid (fxsrl (fx+ lo (spl-ref x 3)) 1)))
              (if (fx>=? lo mid) jolt-nil
                  (begin (spl-set! x 2 mid)
-                        (make-spl (spl-ref x 7) 'vec (spl-ref x 1) lo mid (spl-ref x 4) (spl-ref x 5))))))
+                        (let ((p (make-spl (spl-ref x 7) 'vec (spl-ref x 1) lo mid (spl-ref x 4) (spl-ref x 5))))
+                          ;; the halves watch the same count
+                          (spl-set! p 8 (spl-ref x 8)) (spl-set! p 9 (spl-ref x 9))
+                          p)))))
     (else
      ;; IteratorSpliterator / LLSpliterator take batches of 1024 more each time;
      ;; the concurrent linked queues start at one and grow by one
@@ -2422,7 +2446,7 @@
                              (let ((v (spl-advance! self)))
                                (if (eq? v spl-none) #f
                                    (begin (jolt-fi-call f "accept" v)
-                                          (when (eq? (spl-ref self 0) 'live) (spl-live-check! self))
+                                          (if (eq? (spl-ref self 0) 'live) (spl-live-check! self) (spl-watch-check! self))
                                           #t)))))
         (cons "forEachRemaining" (lambda (self f)
                                    (when (jolt-nil? f) (jx-npe))
@@ -2440,7 +2464,7 @@
                                                (jolt-fi-call f "accept" (if (fx<? i (al-cnt l)) (al-ref l i) jolt-nil))
                                                (loop (fx+ i 1))))))
                                        (let loop () (let ((v (spl-advance! self))) (unless (eq? v spl-none) (jolt-fi-call f "accept" v) (loop)))))
-                                   (when (eq? (spl-ref self 0) 'live) (spl-live-check! self))
+                                   (if (eq? (spl-ref self 0) 'live) (spl-live-check! self) (spl-watch-check! self))
                                    jolt-nil))
         (cons "trySplit" (lambda (self) (spl-split! self)))
         (cons "estimateSize" (lambda (self)
@@ -2468,10 +2492,17 @@
 (define (spl-it c) (jx-call c "iterator" '()))
 (define (spl-n c) (jnum->exact (jx-call c "size" '())))
 (define (spl-vec-of cls chars . cmp)
-  ;; late-binding: the elements are read at the spliterator's first use
-  (lambda (self) (make-spl cls 'lazy (lambda () (jxc-elems self)) 0 0 chars (if (pair? cmp) (car cmp) jolt-nil))))
+  ;; late-binding: the elements are read at the spliterator's first use, and
+  ;; the modCount of a collection that keeps one taken then
+  (lambda (self) (spl-lazy-of cls chars self (if (pair? cmp) (car cmp) jolt-nil))))
+(define (spl-lazy-of cls chars self cmp)
+  (let ((s (make-spl cls 'lazy (lambda () (jxc-elems self)) 0 0 chars cmp)))
+    (when (jutil-modcount self) (spl-set! s 8 self))
+    s))
 (define (spl-snapshot-of cls chars) (lambda (self) (make-vec-spl cls chars (jxc-elems self))))
-(define (spl-iter-of cls chars) (lambda (self) (make-iter-spl cls chars (spl-it self) (spl-n self))))
+;; Spliterators.spliterator(collection, …): the iterator and the size are taken
+;; at first use
+(define (spl-iter-of cls chars) (lambda (self) (make-spl cls 'iterc self 0 0 chars jolt-nil)))
 (define spl-OSS (fxior spl-ORDERED spl-SIZED spl-SUBSIZED))                    ; 16464
 (define (spl-entry-cmp cmp)
   ;; TreeMap's EntrySpliterator orders entries by key, under the map's comparator
@@ -2502,13 +2533,14 @@
     (cons "lhm-keyset" (spl-iter-of "java.util.Spliterators$IteratorSpliterator" (fxior spl-OSS spl-DISTINCT)))
     (cons "lhm-values" (spl-iter-of "java.util.Spliterators$IteratorSpliterator" spl-OSS))
     (cons "lhm-entryset" (spl-iter-of "java.util.Spliterators$IteratorSpliterator" (fxior spl-OSS spl-DISTINCT)))
-    (cons "treeset" (lambda (self) (make-vec-spl "java.util.TreeMap$KeySpliterator" (fxior spl-DISTINCT spl-SORTED spl-ORDERED spl-SIZED)
-                                                 (jxc-elems self) (jx-call self "comparator" '()))))
-    (cons "treemap-keyset" (lambda (self) (make-vec-spl "java.util.TreeMap$KeySpliterator" (fxior spl-DISTINCT spl-SORTED spl-ORDERED spl-SIZED)
-                                                        (jxc-elems self) (jx-call self "comparator" '()))))
+    ;; TreeMap's spliterators bind to the tree at first use
+    (cons "treeset" (lambda (self) (spl-lazy-of "java.util.TreeMap$KeySpliterator" (fxior spl-DISTINCT spl-SORTED spl-ORDERED spl-SIZED)
+                                                self (jx-call self "comparator" '()))))
+    (cons "treemap-keyset" (lambda (self) (spl-lazy-of "java.util.TreeMap$KeySpliterator" (fxior spl-DISTINCT spl-SORTED spl-ORDERED spl-SIZED)
+                                                       self (jx-call self "comparator" '()))))
     (cons "treemap-values" (spl-vec-of "java.util.TreeMap$ValueSpliterator" (fxior spl-ORDERED spl-SIZED)))
-    (cons "treemap-entryset" (lambda (self) (make-vec-spl "java.util.TreeMap$EntrySpliterator" (fxior spl-DISTINCT spl-SORTED spl-ORDERED spl-SIZED)
-                                                          (jxc-elems self) (spl-entry-cmp (tmr-cmp-obj (v-root self))))))
+    (cons "treemap-entryset" (lambda (self) (spl-lazy-of "java.util.TreeMap$EntrySpliterator" (fxior spl-DISTINCT spl-SORTED spl-ORDERED spl-SIZED)
+                                                         self (spl-entry-cmp (tmr-cmp-obj (v-root self))))))
     (cons "arrays-aslist" (spl-vec-of "java.util.Spliterators$ArraySpliterator" spl-OSS))
     (cons "jx-listn" (spl-vec-of "java.util.AbstractList$RandomAccessSpliterator" spl-OSS))
     (cons "jx-list12" (spl-vec-of "java.util.AbstractList$RandomAccessSpliterator" spl-OSS))
@@ -2541,15 +2573,21 @@
             (for-each (lambda (t) (when t (register-host-methods! t (list (cons "spliterator" spl-of-inner)))))
                       (list (list-ref f 1) (list-ref f 2))))
           jx-families)
+;; a wrapper's modCount is the collection's it wraps: its iterator is that
+;; collection's, so a reduce or a stream over it is fail-fast the same way
+(for-each (lambda (f)
+            (for-each (lambda (t) (when t (register-modcount! t (lambda (w) (jutil-modcount (jxw-inner w))))))
+                      (list (list-ref f 1) (list-ref f 2))))
+          jx-families)
 ;; any other Collection: the interface's default — a RandomAccess List's
 ;; RandomAccessSpliterator, otherwise an IteratorSpliterator, ORDERED for a List
 ;; and DISTINCT for a Set
 (define (spl-default self)
   (cond ((and (jx-isa? self "java.util.List") (jx-isa? self "java.util.RandomAccess"))
          (make-vec-spl "java.util.AbstractList$RandomAccessSpliterator" spl-OSS (jxc-elems self)))
-        ((jx-isa? self "java.util.List") (make-iter-spl "java.util.Spliterators$IteratorSpliterator" spl-OSS (spl-it self) (spl-n self)))
-        ((jx-isa? self "java.util.Set") (make-iter-spl "java.util.Spliterators$IteratorSpliterator" (fxior spl-SIZED spl-SUBSIZED spl-DISTINCT) (spl-it self) (spl-n self)))
-        (else (make-iter-spl "java.util.Spliterators$IteratorSpliterator" (fxior spl-SIZED spl-SUBSIZED) (spl-it self) (spl-n self)))))
+        ((jx-isa? self "java.util.List") ((spl-iter-of "java.util.Spliterators$IteratorSpliterator" spl-OSS) self))
+        ((jx-isa? self "java.util.Set") ((spl-iter-of "java.util.Spliterators$IteratorSpliterator" (fxior spl-SIZED spl-SUBSIZED spl-DISTINCT)) self))
+        (else ((spl-iter-of "java.util.Spliterators$IteratorSpliterator" (fxior spl-SIZED spl-SUBSIZED)) self))))
 (hashtable-set! cd-default-tbl "java.util.Collection"
                 (append (hashtable-ref cd-default-tbl "java.util.Collection" '()) (list (list "spliterator" 0 spl-default))))
 ;; a persistent collection: a vector's own (PersistentVector$3), a map's

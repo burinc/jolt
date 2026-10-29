@@ -1431,6 +1431,14 @@
     (string-append "(try (jolt.host/image-read \"" tmp "\") :read (catch Exception e (ex-message e)))")
     "image: cannot read a java.util.ArrayDeque at 0 -> 0: it holds nil, which an ArrayDeque cannot (an image written before format 14 let one in)")
 
+;; The hash and tree collections travel by codec and are rebuilt through their
+;; constructors, so a restored one carries a modCount (jolt-i6iwq): its
+;; iterators fail fast exactly as a fresh one's do.
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" [(java.util.HashSet. [1 2]) (java.util.HashMap. {1 2 3 4}) (java.util.LinkedHashMap. {1 2 3 4}) (java.util.TreeMap. {1 2 3 4}) (java.util.TreeSet. [1 2])])"))
+(is "restored hash and tree collections have fail-fast iterators"
+    (string-append "(mapv (fn [c add] (let [it (.iterator (if (instance? java.util.Map c) (.keySet c) c))] (.next it) (add c) (try (.next it) :no-cme (catch java.util.ConcurrentModificationException _ :cme)))) (jolt.host/image-read \"" tmp "\") [#(.add % 9) #(.put % 9 9) #(.put % 9 9) #(.put % 9 9) #(.add % 0)])")
+    "[:cme :cme :cme :cme :cme]")
+
 ;; --- the same proof for the COLLECTION records and their metadata. Format 7
 ;; carried a vector/map/set/list/lazy-seq/() as the slotless records
 ;; (chez-pvec-v3, chez-pmap-v5, chez-pset-v2, chez-cseq-v6, jolt-lazyseq-v2,

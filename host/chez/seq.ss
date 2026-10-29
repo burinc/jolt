@@ -1892,6 +1892,23 @@
 ;; jutil-views.ss) reduces over that list directly rather than through a seq of
 ;; it, as a Java Iterable reduces over its iterator. #f until a host sets it.
 (define jolt-reduce-elems-hook #f)
+;; A fail-fast java.util collection (one that keeps a modCount) reduces over its
+;; own iterator, hasNext / next per element, as clojure.core.protocols'
+;; iter-reduce does on the JVM, so a change the reducing fn makes is the next
+;; next()'s ConcurrentModificationException. The hook answers a stepper — a
+;; procedure that runs hasNext / next once and answers the element or
+;; reduce-iter-done — or #f. #f until a host sets it.
+(define jolt-reduce-iter-hook #f)
+(define reduce-iter-done (list 'reduce-iter-done))
+(define (reduce-iterator f acc step)
+  (let ((direct? (procedure? f)))
+    (let rec ((acc acc))
+      (if (jolt-reduced? acc)
+          (jolt-reduced-val acc)
+          (let ((x (step)))
+            (if (eq? x reduce-iter-done)
+                acc
+                (rec (if direct? (f acc x) (jolt-invoke f acc x)))))))))
 (define (reduce-list f acc xs)
   (let ((direct? (procedure? f)))
     (let rec ((acc acc) (xs xs))
@@ -1910,6 +1927,9 @@
        ((and (declares-ireduce? coll) (iface-method coll "reduce" 2))
         => (lambda (m) (let ((r (jolt-invoke m coll f)))
                          (if (jolt-reduced? r) (jolt-reduced-val r) r))))
+       ((and jolt-reduce-iter-hook (jolt-reduce-iter-hook coll))
+        => (lambda (step) (let ((x (step)))
+                            (if (eq? x reduce-iter-done) (jolt-invoke f) (reduce-iterator f x step)))))
        ((and jolt-reduce-elems-hook (jolt-reduce-elems-hook coll))
         => (lambda (xs) (if (null? xs) (jolt-invoke f) (reduce-list f (car xs) (cdr xs)))))
        (else (let ((s (jolt-seq coll)))
@@ -1923,6 +1943,7 @@
        ((iface-method coll "reduce" 3)
         => (lambda (m) (let ((r (jolt-invoke m coll f init)))
                          (if (jolt-reduced? r) (jolt-reduced-val r) r))))
+       ((and jolt-reduce-iter-hook (jolt-reduce-iter-hook coll)) => (lambda (it) (reduce-iterator f init it)))
        ((and jolt-reduce-elems-hook (jolt-reduce-elems-hook coll)) => (lambda (xs) (reduce-list f init xs)))
        (else (reduce-seq f init (jolt-seq coll)))))))
 
@@ -1950,6 +1971,7 @@
     ((iface-method from "reduce" 3)
      => (lambda (m) (let ((r (jolt-invoke m from f acc)))
                       (if (jolt-reduced? r) (jolt-reduced-val r) r))))
+    ((and jolt-reduce-iter-hook (jolt-reduce-iter-hook from)) => (lambda (it) (reduce-iterator f acc it)))
     (else (reduce-seq f acc (jolt-seq from)))))
 (define (jolt-into to from)
   (cond

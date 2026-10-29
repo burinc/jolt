@@ -552,6 +552,31 @@
           (let ((end (jolt-make-lazy-seq
                        (lambda () (unless (eqv? e (jutil-modcount l)) (jutil-cme!)) jolt-nil))))
             (fold-right (lambda (x rest) (make-cseq x rest sk-cons jolt-nil)) end xs)))))))
+;; Any other collection that keeps a modCount — the hash and tree sets and the
+;; map views — streams as its spliterator walks on the JDK: a HashMap's or a
+;; TreeMap's binds its elements at the first pull and checks the count once the
+;; walk ends; a LinkedHashMap's or LinkedHashSet's (an IteratorSpliterator)
+;; walks the collection's fail-fast iterator one element at a time.
+(define (stream-list-source? x)
+  (or (al-family? x) (cd-sublist? x) (and (jhost? x) (member (jhost-tag x) '("jx-vector" "jx-stack")) #t)))
+(define (stream-iterator-seq it)
+  (let ((has? (iterator-seq-method it "hasNext")) (next (iterator-seq-method it "next")))
+    (let loop ()
+      (jolt-make-lazy-seq
+        (lambda ()
+          (if (jolt-truthy? (has? it))
+              (let ((x (next it))) (make-cseq x (loop) sk-cons jolt-nil))
+              jolt-nil))))))
+(define (stream-live-coll c)
+  (jolt-make-lazy-seq
+    (lambda ()
+      (if (lh-kind c)
+          (stream-iterator-seq (record-method-dispatch c "iterator" jolt-nil))
+          (let* ((e (jutil-modcount c))
+                 (xs (seq->list (jolt-seq c)))
+                 (end (jolt-make-lazy-seq
+                        (lambda () (unless (eqv? e (jutil-modcount c)) (jutil-cme!)) jolt-nil))))
+            (fold-right (lambda (x rest) (make-cseq x rest sk-cons jolt-nil)) end xs))))))
 ;; any other java.util shim that is a Collection (not a Map)
 (define (jutil-collection? x) (and (memq (jutil-coll-kind x) '(set ralist list coll entries)) #t))
 (define arm-priority-stream 29)
@@ -561,7 +586,7 @@
              (stream-source? obj))
         (if (null? (method-rest-args->list rest))
             (let ((st (make-stream 'ref (if (jutil-modcount obj)
-                                            (stream-live-list obj)
+                                            (if (stream-list-source? obj) (stream-live-list obj) (stream-live-coll obj))
                                             (if (or (al-family? obj) (hs-hashset? obj) (jutil-collection? obj))
                                             ;; a mutable source is snapshotted, as the JDK's
                                             ;; late-binding spliterator is by the time it runs

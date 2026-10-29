@@ -25,18 +25,18 @@
             (codec-kvs (map (lambda (k) (cons k (hashtable-ref (hm-tbl m) k jolt-nil))) (hm-keys-ordered m)))))
   (lambda (h)
     (if (string=? (vector-ref h 0) "properties")
-        (make-jhost "properties" (vector (make-hashtable hm-hash jolt=2) '()
+        (make-jhost "properties" (vector (make-hashtable hm-hash jolt=2) '() 0
                                          (if (jolt-nil? (vector-ref h 1)) #f (vector-ref h 1)) #f))
         ;; each map's own kind of table: weak keys, identity keys, or equality
         (let ((tag (vector-ref h 0)))
-          (cond ((string=? tag "jx-weak-hashmap") (make-jhost tag (vector (make-weak-hashtable hm-hash jolt=2) (list 'v))))
-                ((string=? tag "jx-identity-hashmap") (make-jhost tag (vector (make-eq-hashtable) '())))
-                (else (make-jhost tag (vector (make-hashtable hm-hash jolt=2) '())))))))
+          (cond ((string=? tag "jx-weak-hashmap") (make-jhost tag (hm-state (make-weak-hashtable hm-hash jolt=2) (list 'v))))
+                ((string=? tag "jx-identity-hashmap") (make-jhost tag (hm-state (make-eq-hashtable) '())))
+                (else (make-jhost tag (hm-state (make-hashtable hm-hash jolt=2) '())))))))
   (lambda (m items)
     (codec-each-kv! items (lambda (k v) (hm-note-key! m k) (hashtable-set! (hm-tbl m) k v)))))
 (register-image-codec! "java.util.HashSet" '("hashset")
   (lambda (s) (vector "hashset" (hs->list s)))
-  (lambda (h) (make-jhost h (vector (make-hashtable hm-hash jolt=2) '())))
+  (lambda (h) (make-jhost h (hm-state (make-hashtable hm-hash jolt=2) '())))
   (lambda (s items) (for-each (lambda (x) (hm-note-key! s x) (hashtable-set! (hm-tbl s) x #t)) items)))
 
 ;; ---- LinkedHashMap / LinkedHashSet: encounter order and access order -------------
