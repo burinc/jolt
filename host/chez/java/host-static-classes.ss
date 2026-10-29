@@ -946,7 +946,8 @@
              (hashtable-set! seen (car ks) #t)
              (loop (cdr ks) (cons (car ks) acc)))
             (else (loop (cdr ks) acc))))))
-(define (hm-state tbl ord) (vector tbl ord 0))
+;; slot 3 is a ConcurrentHashMap's reservations (chm-reserving); '() elsewhere
+(define (hm-state tbl ord) (vector tbl ord 0 '()))
 (define (hm-mc self) (vector-ref (jhost-state self) 2))
 (define-syntax hm-bump!
   ;; inline: every new key and every removal pays it
@@ -1309,20 +1310,71 @@
 (register-class-ctor! "java.util.concurrent.ConcurrentHashMap" make-chm-jhost)
 (define (chm-npe!) (throw-jvm 'NullPointerException jolt-nil))
 (define (chm-method name) (cdr (assoc name hashmap-methods)))
+;; While computeIfAbsent, or compute over an absent key, runs its function, the
+;; JDK holds a ReservationNode in the key's bin, and a write that reaches that
+;; bin from inside the function is IllegalStateException "Recursive update"
+;; (jolt-2gc66); reads and other bins go through. Slot 3 lists the keys being
+;; computed, each with the thread or fiber computing it: another thread's write
+;; waits for the bin on the JDK and is never refused. Which OTHER keys share the
+;; bin is the JDK's table layout, so only the reserved key itself is refused here
+;; (known-divergences).
+(define (chm-owner)
+  (let ((r (virtual-register jolt-vreg-current-fiber))) (if (eq? r 0) (get-thread-id) r)))
+(define (chm-reserved self) (vector-ref (jhost-state self) 3))
+(define (chm-check-key! self k)
+  (let ((rs (chm-reserved self)))
+    (unless (null? rs)
+      (let ((me (chm-owner)))
+        (when (exists (lambda (r) (and (eqv? (car r) me) (jolt=2 (cdr r) k))) rs)
+          (throw-jvm 'IllegalStateException "Recursive update"))))))
+(define (chm-reserving self k thunk)
+  (let ((r (cons (chm-owner) k)) (st (jhost-state self)))
+    (dynamic-wind
+      (lambda () (vector-set! st 3 (cons r (vector-ref st 3))))
+      thunk
+      (lambda () (vector-set! st 3 (remq r (vector-ref st 3)))))))
 ;; hashmap's methods, refusing a null key or value as ConcurrentHashMap does;
 ;; fixed arities, so a call allocates nothing for the check
 (register-host-methods! "chm"
   (append hashmap-methods
           (let ((put (chm-method "put")) (pia (chm-method "putIfAbsent")) (cv (chm-method "containsValue"))
-                (rm (chm-method "remove")))
-            (list (cons "put" (lambda (self k v) (when (or (jolt-nil? k) (jolt-nil? v)) (chm-npe!)) (put self k v)))
-                  (cons "putIfAbsent" (lambda (self k v) (when (or (jolt-nil? k) (jolt-nil? v)) (chm-npe!)) (pia self k v)))
+                (rm (chm-method "remove")) (rep (chm-method "replace")) (mrg (chm-method "merge"))
+                (cip (chm-method "computeIfPresent")) (cia (chm-method "computeIfAbsent"))
+                (cmp (chm-method "compute")) (pall (chm-method "putAll")))
+            (list (cons "put" (lambda (self k v) (when (or (jolt-nil? k) (jolt-nil? v)) (chm-npe!)) (chm-check-key! self k) (put self k v)))
+                  (cons "putIfAbsent" (lambda (self k v) (when (or (jolt-nil? k) (jolt-nil? v)) (chm-npe!)) (chm-check-key! self k) (pia self k v)))
                   (cons "get" (lambda (self k) (when (jolt-nil? k) (chm-npe!)) (hashtable-ref (hm-tbl self) k jolt-nil)))
                   (cons "containsKey" (lambda (self k) (when (jolt-nil? k) (chm-npe!)) (if (hashtable-contains? (hm-tbl self) k) #t #f)))
                   (cons "containsValue" (lambda (self v) (when (jolt-nil? v) (chm-npe!)) (cv self v)))
                   (cons "remove" (case-lambda
-                                   ((self k) (when (jolt-nil? k) (chm-npe!)) (rm self k))
-                                   ((self k v) (when (jolt-nil? k) (chm-npe!)) (rm self k v))))))))
+                                   ((self k) (when (jolt-nil? k) (chm-npe!)) (chm-check-key! self k) (rm self k))
+                                   ((self k v) (when (jolt-nil? k) (chm-npe!)) (chm-check-key! self k) (rm self k v))))
+                  (cons "replace" (case-lambda
+                                    ((self k v) (chm-check-key! self k) (rep self k v))
+                                    ((self k old v) (chm-check-key! self k)
+                                     (if (and (hashtable-contains? (hm-tbl self) k)
+                                              (jolt=2 old (hashtable-ref (hm-tbl self) k jolt-nil)))
+                                         (begin (hashtable-set! (hm-tbl self) k v) #t)
+                                         #f))))
+                  (cons "merge" (lambda (self k v f) (chm-check-key! self k) (mrg self k v f)))
+                  (cons "computeIfPresent" (lambda (self k f) (chm-check-key! self k) (cip self k f)))
+                  (cons "computeIfAbsent"
+                        (lambda (self k f)
+                          (chm-check-key! self k)
+                          (if (hashtable-contains? (hm-tbl self) k)
+                              (cia self k f)
+                              (chm-reserving self k (lambda () (cia self k f))))))
+                  (cons "compute"
+                        (lambda (self k f)
+                          (chm-check-key! self k)
+                          (if (hashtable-contains? (hm-tbl self) k)
+                              (cmp self k f)
+                              (chm-reserving self k (lambda () (cmp self k f))))))
+                  (cons "putAll" (lambda (self m)
+                                   (unless (null? (chm-reserved self))
+                                     (for-each (lambda (e) (chm-check-key! self (jolt-nth e 0)))
+                                               (seq->list (jolt-seq m))))
+                                   (pall self m)))))))
 ;; WeakHashMap: the HashMap shim over a weak table (Chez's generic weak
 ;; hashtables hold their keys weakly under jolt's own hash and equality), so an
 ;; entry whose key nothing else holds goes at the next collection, as on the JDK.
