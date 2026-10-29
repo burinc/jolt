@@ -640,11 +640,15 @@
                            (substring path (+ i 1) (string-length path)))
                           (else (loop (- i 1)))))))
         (dyn-with-frame
-          (list (cons ldr-file-cell (ldr-source-name path))
-                (cons ldr-spath-cell name)
-                (cons ldr-warn-cell (var-cell-deref ldr-warn-cell))
-                (cons ldr-assert-cell (var-cell-deref ldr-assert-cell))
-                (cons ldr-unchecked-cell (var-cell-deref ldr-unchecked-cell)))
+          (append
+            (list (cons ldr-file-cell (ldr-source-name path))
+                  (cons ldr-spath-cell name)
+                  (cons ldr-warn-cell (var-cell-deref ldr-warn-cell))
+                  (cons ldr-assert-cell (var-cell-deref ldr-assert-cell))
+                  (cons ldr-unchecked-cell (var-cell-deref ldr-unchecked-cell)))
+            ;; *ns*, as RT.load binds it: the file's ns form switches this
+            ;; frame's binding, not the caller's namespace
+            (jolt-ns-binding-pairs))
           thunk))))
 
 ;; The loader's two compile-from-source entrances -- load-jolt-file* below and

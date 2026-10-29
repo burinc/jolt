@@ -173,7 +173,7 @@
   '("clojure.core/eval" "clojure.core/resolve" "clojure.core/ns-resolve"
     "clojure.core/requiring-resolve" "clojure.core/find-var" "clojure.core/intern"
     "clojure.core/load-string" "clojure.core/load-file" "clojure.core/load-reader"
-    "clojure.core/load"
+    "clojure.core/load" "jolt.host/eval-string"
     ;; Reflective enumeration — a program that walks a namespace's var table at
     ;; runtime via ns-publics/ns-interns/&c finds vars invisible to the static
     ;; IR graph, so any such reference bails the shake.
@@ -224,6 +224,8 @@
 (define dce-compile-refs
   '("clojure.core/eval" "clojure.core/load-string" "clojure.core/load-file"
     "clojure.core/load-reader" "clojure.core/load"
+    ;; load-string without its *ns* binding, for a REPL's own entries
+    "jolt.host/eval-string"
     ;; Images. Restoring one compiles the fn SOURCES it carries (state-image.ss
     ;; image-compile-eval-seam), so a program that reads one back needs the
     ;; compiler as surely as one that evals; and WRITING one goes through the

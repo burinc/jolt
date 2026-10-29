@@ -54,6 +54,7 @@ empty-coll-arm
 enable-trace!
 entry-at
 escape-fn?
+eval-string
 exact?
 extend-class!
 extension-epoch

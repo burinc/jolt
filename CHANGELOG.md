@@ -210,6 +210,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`load-string` no longer leaves the caller in the namespace it switched
+  to.** `(do (load-string "(ns foo)") *ns*)` answered `foo`; it now answers
+  the caller's namespace, as on the JVM, where `Compiler.load` binds `*ns*`
+  for the load. `load-file`, `load` and `require` bind it the same way, and
+  `load-reader`, which was missing, is there. The REPL and the nREPL `eval`
+  op still switch namespace on an `(ns …)` or `in-ns`: each binds `*ns*` for
+  the session and reads it after the eval, as clojure.main and nREPL do. The
+  nREPL `load-file` op is a load and leaves the session's namespace alone.
 - **A `java.io.File` whose path holds a NUL no longer acts on another file.**
   The OS reads a path only up to a NUL, so `(.delete (File. "notes.txt\u0000x"))`
   deleted `notes.txt`, and `exists`, `length`, `list` and the rest answered

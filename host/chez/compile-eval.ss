@@ -804,7 +804,7 @@
 ;; no path: nil and "NO_SOURCE_FILE". Only the FILE goes: load-string is source,
 ;; and a read error in it keeps the :read-source phase a read-string's lacks.
 (define ls-file-cells #f)
-(define (jolt-load-string s)
+(define (jolt-eval-string s)
   (let ((end (string-length s))
         (drl (guard (_ (#t #f)) data-readers-active)))
     ;; Resolved once the vars exist (a bootstrap context may run this first),
@@ -849,7 +849,19 @@
 ;; special-symbol lists (host-contract.ss) so it resolves as an ordinary core var.
 (def-var! "clojure.core" "eval"
   (lambda (form) (jolt-compile-eval-form form (chez-current-ns))))
+;; load-string is Compiler.load over a string: *ns* is bound for the load, so
+;; an (ns …) in the string does not leave the caller in that namespace. A REPL
+;; is the one place that wants the switch to stick, and it gets it the way
+;; clojure.main and nREPL do: it binds *ns* once for the session and evaluates
+;; each entry with jolt.host/eval-string, the same loop without the binding,
+;; reading *ns* afterwards.
+(define (jolt-load-string s)
+  (jolt-with-ns-bound (lambda () (jolt-eval-string s))))
 (def-var! "clojure.core" "load-string" jolt-load-string)
+(def-var! "jolt.host" "eval-string" jolt-eval-string)
+;; load-reader: read the reader to its end and load that, as load-string does.
+(def-var! "clojure.core" "load-reader"
+  (lambda (rdr) (jolt-load-string ((var-deref "clojure.core" "slurp") rdr))))
 
 ;; --- jolt.scheme: the Scheme escape hatch (epic jolt-of08.6) ------------------
 ;; stdlib/jolt/scheme.clj is a thin veneer over these two. The contract is RAW:

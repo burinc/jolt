@@ -714,6 +714,25 @@ else
   echo "  FAIL: the REPL prompt should name the current namespace (got \`$repl_ns\`)"
   fails=$((fails + 1))
 fi
+# load-string binds *ns* for its load (Compiler.load), so the REPL and nREPL no
+# longer get their namespace switch from it leaking: an (ns …) entry still has
+# to switch the session, and -e still evaluates its forms in one namespace.
+repl_nsf="$(printf '(ns foo)\n(str *ns*)\n(load-string "(ns bar)")\n(str *ns*)\n' | $jolt repl 2>/dev/null)"
+if printf '%s' "$repl_nsf" | grep -q '^foo=> "foo"' && ! printf '%s' "$repl_nsf" | grep -q '^bar=>'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: an (ns foo) REPL entry should switch the session, a load-string should not (got \`$repl_nsf\`)"
+  fails=$((fails + 1))
+fi
+e_nsf="$($jolt -e '(ns foo) (println *ns*)' 2>/dev/null | tail -1)"
+if [ "$e_nsf" = "foo" ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: -e \"(ns foo) (println *ns*)\" should print foo (got \`$e_nsf\`)"
+  fails=$((fails + 1))
+fi
+check '(do (require (quote jolt.nrepl)) (let [r1 (jolt.nrepl/evaluate "(ns nr-sw.a)" "user") r2 (jolt.nrepl/evaluate "(str *ns*)" (:ns r1)) r3 (jolt.nrepl/evaluate "(in-ns (quote nr-sw.b))" (:ns r2)) r4 (jolt.nrepl/evaluate "(str *ns*)" (:ns r3))] [(:ns r1) (:value r2) (:ns r3) (:value r4) (str *ns*)]))' '["nr-sw.a" "\"nr-sw.a\"" "nr-sw.b" "\"nr-sw.b\"" "user"]'
+check '(do (require (quote jolt.nrepl)) (let [sent (atom [])] ((var jolt.nrepl/built-in-handler) {"op" "load-file" "file" "(ns nr-lf.a) (def z 3)" "ns" "user" :reply #(swap! sent conj %)}) [(get (last @sent) "ns") @(resolve (quote nr-lf.a/z))]))' '["user" 3]'
 nsm="$(mktemp -d)"
 mkdir -p "$nsm/src/nsm"
 printf '{:paths ["src"]}\n' > "$nsm/deps.edn"

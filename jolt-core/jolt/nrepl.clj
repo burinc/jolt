@@ -395,8 +395,10 @@
 
 (defn evaluate
   "Evaluate `code` (optionally in loaded ns `ns-str`). Returns
-  {:value .. :out .. :ns .. :err ..}. in-ns — not (binding [*ns* ..]) — sets the
-  ns load-string resolves against on jolt. Reusable by eval middleware.
+  {:value .. :out .. :ns .. :err ..}. As JVM nREPL's eval does, it binds *ns*
+  to that namespace (else the current one) around the eval, and :ns is the
+  binding's value when the eval is done, so an (ns foo) or in-ns in the code is
+  what the session's next eval starts in. Reusable by eval middleware.
 
   With two arguments, *out* is captured and returned whole as :out when the eval
   finishes. With a third, a map {:out f :err f}, output streams instead, as
@@ -405,6 +407,8 @@
   the eval is still running, so an editor's console shows a long job's progress.
   Whatever is left unflushed is sent before this returns, and :out is then empty.
   A future the eval starts inherits the writers, so its output streams too.
+  :load true in the map evaluates the code as a load (load-string), as the
+  load-file op does, so a namespace switch in it does not reach :ns.
 
   The value is printed inside the eval, under its *out* and its try: what a lazy
   result prints as it is realized is the eval's output, and an error while
@@ -419,18 +423,29 @@
     :ex-class       the `ex` string, \"class java.lang.ArithmeticException\"
     :root-ex-class  the `root-ex` string, the class of the root cause"
   ([code ns-str] (evaluate code ns-str nil))
-  ([code ns-str {on-out :out on-err :err}]
+  ([code ns-str {on-out :out on-err :err load? :load}]
    (let [result (atom nil) evaluated (atom false) printed (atom nil)
          err (atom nil) exc (atom nil) failure (atom nil)
+         start-ns (or (when (and ns-str (not (str/blank? ns-str)))
+                        (find-ns (symbol ns-str)))
+                      *ns*)
+         ns-after (atom (str (ns-name start-ns)))
          run (fn []
-               (binding [*capturing-thread* (Thread/currentThread)]
+               (binding [*capturing-thread* (Thread/currentThread)
+                         *ns* start-ns]
                  (let [phase (volatile! nil)]
-                   (try (when (and ns-str (not (str/blank? ns-str)) (find-ns (symbol ns-str)))
-                          (in-ns (symbol ns-str)))
+                   (try
                         ;; strict, as clojure.main's REPL and `jolt repl`: an
                         ;; undefined name is "Unable to resolve symbol", and a
-                        ;; forward reference across evals takes a declare
-                        (let [v (load-string code)]
+                        ;; forward reference across evals takes a declare.
+                        ;; eval-string, not load-string: load-string binds *ns*
+                        ;; for its own load, and this eval's switch must reach :ns
+                        (let [v (if load?
+                                  ;; a load-file op is a load, as nREPL's is
+                                  ;; (Compiler.load): the file's ns form does
+                                  ;; not switch the session
+                                  (load-string code)
+                                  (jolt.host/eval-string code))]
                           (reset! result v)
                           (reset! evaluated true)
                           (vreset! phase :print-eval-result)
@@ -450,7 +465,8 @@
                             (reset! last-backtrace bt)
                             (reset! failure {:phase @phase :frame (first (filter user-frame? frames))
                                              :line (:line pos) :outer outer})
-                            (reset! err (str (err-msg e) (when bt (str "\n" bt))))))))))
+                            (reset! err (str (err-msg e) (when bt (str "\n" bt))))))
+                        (finally (reset! ns-after (str (ns-name *ns*))))))))
          out (if on-out
                (let [ow (chunk-writer on-out)
                      ew (when on-err (chunk-writer on-err))]
@@ -476,7 +492,7 @@
        (alter-var-root #'*e (constantly @exc)))
      (cond-> {:value (when (nil? @err) @printed)
               :out out
-              :ns (str (ns-name *ns*))
+              :ns @ns-after
               :err @err}
        @exc (merge (let [e @exc
                          {:keys [phase] :as f} @failure
@@ -568,7 +584,8 @@
             {:keys [value ns err err-msg ex-class root-ex-class]}
             (evaluate code (get request "ns")
                       {:out #(respond request {"out" %})
-                       :err #(respond request {"err" %})})]
+                       :err #(respond request {"err" %})
+                       :load (= op "load-file")})]
         ;; an error goes out as JVM nREPL sends it: the err->msg text, then the
         ;; classes with eval-error, then done on its own
         (if err
