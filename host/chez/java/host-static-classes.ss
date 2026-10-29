@@ -1063,11 +1063,6 @@
       (when (and (pair? args) (not (number? (car args))))
         (hm-copy-into-ordered! self (car args)))
       self)))
-(define (hm->pmap self)
-  (let ((m (jolt-hash-map)))
-    (for-each (lambda (k) (set! m (jolt-assoc m k (hashtable-ref (hm-tbl self) k jolt-nil))))
-              (hm-keys-ordered self))
-    m))
 ;; How a HashMap-shaped map's own walks and compute methods answer a change
 ;; made under them: a HashMap checks its modCount once a forEach / replaceAll
 ;; walk ends and around each compute-family function; an IdentityHashMap and a
