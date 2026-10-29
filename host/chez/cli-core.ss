@@ -406,7 +406,7 @@
           (jolt-sample-init-from-env!)
           (let ((at-exit (var-deref "jolt.profile" "report-at-exit")))
             (when (jolt-profile-instrument! #t)
-              (jolt-add-shutdown-hook (lambda () (jolt-invoke at-exit)))))))))
+              (jolt-add-runtime-shutdown-hook (lambda () (jolt-invoke at-exit)))))))))
 
 (define (jolt-cli-run cli-args prepare-build!)
   ;; Every entry starts in user, as clojure.main's does. The image bakes jolt.main

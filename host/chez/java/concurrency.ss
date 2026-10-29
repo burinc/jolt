@@ -5007,21 +5007,36 @@
 (define jolt-shutdown-ran (box #f))
 
 (define (jolt-register-shutdown-hook! key thunk)
-  ;; A registered hook is a second mutator: the watcher thread runs it, and it can
-  ;; touch whatever jolt value the program can. That is what jolt-mt? guards, and
-  ;; the watcher does not flip it itself — it is forked dormant so a program with
-  ;; no hooks keeps the single-threaded lazy path (lazy-bridge.ss). Flipping HERE
-  ;; is race-free for the same reason the fork does it: the registering thread is
-  ;; either registering or forcing a cell, never both, and if any other thread
-  ;; exists the flag is already on.
+  ;; A program's hook is a second mutator: on a signal the watcher thread runs it
+  ;; while the program's own threads are still running, and it can touch whatever
+  ;; jolt value they can. That is what jolt-mt? guards. Flipping HERE is race-free
+  ;; for the same reason the fork does it: the registering thread is either
+  ;; registering or forcing a cell, never both, and if any other thread exists the
+  ;; flag is already on. Flipping later, as the watcher wakes, is not: the program
+  ;; may be halfway through realizing a cell the hook goes on to force, and what it
+  ;; published on the single-threaded path went out without a release fence.
   (jolt-mark-mt!)
+  (jolt-enlist-shutdown-hook! key thunk))
+
+(define (jolt-add-shutdown-hook thunk) (jolt-register-shutdown-hook! thunk thunk))
+
+;; A hook of the runtime's own: the JOLT_PROFILE reports and the block-count dump
+;; a --profile-gen binary writes (sampler.ss, cli-core.ss). Every built binary's
+;; launcher registers the dump, so marking the process multi-threaded for it put
+;; every such program's lazy seqs on the claim path, up to 1.45x slower. These
+;; read only what the runtime keeps for them (sample tables, block counters) and
+;; values they build themselves, never a cell or atom the program could be in the
+;; middle of, so they are not a second mutator of anything the flag guards. They
+;; run on the exiting thread, or on the watcher, which marks the process
+;; multi-threaded as it wakes so that its own reads take the guarded paths.
+(define (jolt-add-runtime-shutdown-hook thunk) (jolt-enlist-shutdown-hook! thunk thunk))
+
+(define (jolt-enlist-shutdown-hook! key thunk)
   (jolt-with-mutex jolt-shutdown-mutex
     (set-box! jolt-shutdown-hooks (cons (cons key thunk) (unbox jolt-shutdown-hooks))))
   ;; outside the mutex: arming takes it to test the watcher's flag
   (jolt-arm-shutdown!)
   jolt-nil)
-
-(define (jolt-add-shutdown-hook thunk) (jolt-register-shutdown-hook! thunk thunk))
 
 ;; #t when a hook keyed by KEY was registered and is now removed, matching
 ;; Runtime.removeShutdownHook's boolean.
@@ -5235,6 +5250,9 @@
                       (if (and (= sig 2) target (jolt-sigint-trip! target))
                           (loop)
                           (begin
+                            ;; this thread now runs jolt code alongside the
+                            ;; program's (jolt-add-runtime-shutdown-hook)
+                            (jolt-mark-mt!)
                             (guard (_ (#t #f)) (jolt-run-shutdown-hooks!))
                             (guard (_ (#t #f)) (flush-output-port (current-output-port)))
                             (guard (_ (#t #f)) (flush-output-port (current-error-port)))
