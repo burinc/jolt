@@ -926,8 +926,26 @@
 ;; insertion order for iteration (seq/keySet/values/entrySet render
 ;; deterministically; the JVM's hash order is arbitrary, insertion order is the
 ;; deterministic superset jolt's small maps already use).
+;; The slot holds the keys newest first, as a plain list while every entry in it
+;; is live. A removal leaves its key's entry in place and counts it stale, which
+;; turns the slot into an hm-stale record (jolt-lfm8p: rebuilding the list per
+;; removal made remove linear in the map). A stale entry is one whose key is gone,
+;; or an older entry of a key that came back; hm-keys-ordered skips both, so a
+;; returning key still sits where it was last inserted. Once stale entries
+;; outnumber live keys the list is rebuilt, which keeps remove amortized O(1).
+(define-record-type hm-stale (fields (mutable keys) (mutable count)))
 (define (hm-ord self) (vector-ref (jhost-state self) 1))
 (define (hm-ord! self v) (vector-set! (jhost-state self) 1 v))
+(define (hm-ord-keys o) (if (hm-stale? o) (hm-stale-keys o) o))
+;; newest first, each live key once, at its newest entry
+(define (hm-live-keys self o)
+  (let ((t (hm-tbl self)) (seen (hm-like-table self)))
+    (let loop ((ks (hm-stale-keys o)) (acc '()))
+      (cond ((null? ks) (reverse! acc))
+            ((and (hashtable-contains? t (car ks)) (not (hashtable-contains? seen (car ks))))
+             (hashtable-set! seen (car ks) #t)
+             (loop (cdr ks) (cons (car ks) acc)))
+            (else (loop (cdr ks) acc))))))
 (define (hm-state tbl ord) (vector tbl ord 0))
 (define (hm-mc self) (vector-ref (jhost-state self) 2))
 (define-syntax hm-bump!
@@ -943,7 +961,12 @@
 (define (hm-note-key! self k)
   (when (not (hashtable-contains? (hm-tbl self) k))
     (hm-bump! self)
-    (hm-ord! self (if (hm-weak? self) (list 'v) (cons k (hm-ord self))))))
+    (if (hm-weak? self)
+        (hm-ord! self (list 'v))
+        (let ((o (hm-ord self)))
+          (if (hm-stale? o)
+              (hm-stale-keys-set! o (cons k (hm-stale-keys o)))
+              (hm-ord! self (cons k o)))))))
 ;; values compare as the map's keys do: by identity in an IdentityHashMap
 (define (hm-veq? self a b)
   (if (eq? (hashtable-equivalence-function (hm-tbl self)) eq?) (eq? a b) (jolt=2 a b)))
@@ -960,10 +983,21 @@
 (define (hm-drop-key! self k)
   (when hm-detach-hook (hm-detach-hook self k))
   (hm-bump! self)
-  ;; by the table's own key equivalence: two equal keys are two keys in an IdentityHashMap
-  (hm-ord! self (if (hm-weak? self) (list 'v)
-                    (let ((same? (hashtable-equivalence-function (hm-tbl self))))
-                      (remove (lambda (e) (same? e k)) (hm-ord self))))))
+  ;; k is already out of the table. The newest entry popping off the front (a
+  ;; stack-like use) needs no stale mark; anything else is marked, by the table's
+  ;; own key equivalence for the front check (two equal keys are two keys in an
+  ;; IdentityHashMap).
+  (if (hm-weak? self)
+      (hm-ord! self (list 'v))
+      (let* ((o (hm-ord self)) (ks (hm-ord-keys o)))
+        (cond ((and (pair? ks) ((hashtable-equivalence-function (hm-tbl self)) (car ks) k))
+               (if (hm-stale? o) (hm-stale-keys-set! o (cdr ks)) (hm-ord! self (cdr ks))))
+              ((hm-stale? o)
+               (let ((n (fx+ (hm-stale-count o) 1)))
+                 (if (fx>? n (fx+ (hashtable-size (hm-tbl self)) 32))
+                     (hm-ord! self (hm-live-keys self o))
+                     (hm-stale-count-set! o n))))
+              (else (hm-ord! self (make-hm-stale ks 1)))))))
 (define (hm-clear! self)
   (when hm-detach-hook (hm-detach-hook self hm-detach-hook))
   (hm-bump! self)
@@ -976,7 +1010,8 @@
       ;; order (known-divergences); the Map contract leaves it unspecified
       (map cdr (list-sort (lambda (a b) (< (car a) (car b)))
                           (map (lambda (k) (cons (hm-hash k) k)) (vector->list (hashtable-keys (hm-tbl self))))))
-      (reverse (hm-ord self))))
+      (let ((o (hm-ord self)))
+        (if (hm-stale? o) (reverse! (hm-live-keys self o)) (reverse o)))))
 ;; A hashmap-shaped jhost: the HashMap family and java.util.Properties, which is
 ;; a Hashtable with two string-typed accessors on top and so carries the same
 ;; #(table key-order) state. One predicate for every question about that shape —
