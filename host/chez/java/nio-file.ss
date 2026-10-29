@@ -249,7 +249,12 @@
       (hashtable-ref nio-fs-providers (jhost-tag fs) default-nio-provider)))
 (define (nio-fs-windows? fs) ((nio-provider-windows? (nio-fs-provider fs))))
 
+;; A path string with a NUL names no file: the JDK's UnixPath refuses it as it
+;; parses, so Paths/get, Path/of, File.toPath and resolve all raise rather than
+;; hand the C layer a path it would truncate at the NUL, acting on another file.
 (define (make-nio-path-on fs s)
+  (when (and (eq? fs default-nio-filesystem) (jfile-nul? s))
+    (throw-jvm 'java.nio.file.InvalidPathException (string-append "Nul character not allowed: " s)))
   (make-jhost "nio-path"
               (cons fs (npath-held-for (nio-fs-windows? fs)
                                        (if (string? s) s (npath-string-of s))))))

@@ -215,7 +215,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deleted `notes.txt`, and `exists`, `length`, `list` and the rest answered
   for it. They now give the JDK's answers for an invalid path (false, 0, nil),
   and `createNewFile`, `slurp`, `spit` and the file streams raise "Invalid file
-  path". `Paths/get` still accepts one (jolt-jg8tx).
+  path". `Paths/get`, `Path/of`, `.toPath` and `resolve` raise
+  `InvalidPathException` "Nul character not allowed", as the JDK's do.
 - **`.reduce` follows the class's interfaces.** A vector's seq, an array's
   seq and an array map's seq are `IReduce` and reduce themselves, a string seq
   is `IReduceInit` and reduces only from an init, and a set's, a sorted coll's

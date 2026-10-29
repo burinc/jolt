@@ -813,6 +813,7 @@
 (jch-register-supers! "java.nio.file.FileSystemAlreadyExistsException" '("java.lang.RuntimeException"))
 (jch-register-supers! "java.nio.file.ProviderNotFoundException" '("java.lang.RuntimeException"))
 (jch-register-supers! "java.nio.file.ProviderMismatchException" '("java.lang.IllegalArgumentException"))
+(jch-register-supers! "java.nio.file.InvalidPathException" '("java.lang.IllegalArgumentException"))
 (jch-register-supers! "java.nio.file.ClosedFileSystemException" '("java.lang.IllegalStateException"))
 (jch-register-supers! "java.nio.file.ClosedWatchServiceException" '("java.lang.IllegalStateException"))
 (jch-register-supers! "java.nio.file.ReadOnlyFileSystemException" '("java.lang.UnsupportedOperationException"))
