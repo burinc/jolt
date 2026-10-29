@@ -1765,28 +1765,27 @@
 ;; back. Each map that has handed out nodes keeps a generation per removed key
 ;; and one for clears, which a node compares with the ones it was made under.
 ;; State #(map key last generation map-generations).
-(define hmn-gens (make-weak-eq-hashtable))   ; map -> #(clear-gen key-table)
-(define hmn-gens-mu (make-mutex))
 (define (hmn-gen* g k)
   ;; most maps remove nothing between handing out nodes: skip the key probe then
   (let ((kt (vector-ref g 1)))
     (if (fx=? 0 (hashtable-size kt)) (vector-ref g 0) (+ (vector-ref g 0) (hashtable-ref kt k 0)))))
+;; A map's generations #(clear-gen key-table) live in its own state, slot 3
+;; (host-static-classes.ss hm-state; a ConcurrentHashMap's reservations and a
+;; Properties' defaults sit there too, never a vector). They are written as the
+;; map itself is, so a map one thread owns pays no lock to remove a key.
+(define (hmn-gens-of m) (let ((g (vector-ref (jhost-state m) 3))) (and (vector? g) g)))
 (define (hmn-track! m)
-  ;; this map's generations, made on its first node
-  (or (hashtable-ref hmn-gens m #f)
-      (jolt-with-mutex hmn-gens-mu
-        (or (hashtable-ref hmn-gens m #f)
-            ;; keyed as the map is: by identity in an IdentityHashMap, weakly
-            ;; in a WeakHashMap (a removed key must not be kept here)
-            (let ((g (vector 0 (hm-like-table m)))) (hashtable-set! hmn-gens m g) g)))))
+  ;; made on the map's first node, keyed as the map is: by identity in an
+  ;; IdentityHashMap, weakly in a WeakHashMap (a removed key must not be kept here)
+  (or (hmn-gens-of m)
+      (let ((g (vector 0 (hm-like-table m)))) (vector-set! (jhost-state m) 3 g) g)))
 (set! hm-detach-hook
   (lambda (m k)
-    (let ((g (hashtable-ref hmn-gens m #f)))
+    (let ((g (hmn-gens-of m)))
       (when g
-        (jolt-with-mutex hmn-gens-mu
-          (if (eq? k hm-detach-hook)
-              (vector-set! g 0 (+ 1 (vector-ref g 0)))
-              (hashtable-update! (vector-ref g 1) k (lambda (n) (+ n 1)) 0)))))))
+        (if (eq? k hm-detach-hook)
+            (vector-set! g 0 (+ 1 (vector-ref g 0)))
+            (hashtable-update! (vector-ref g 1) k (lambda (n) (+ n 1)) 0))))))
 ;; HashMap, WeakHashMap and IdentityHashMap share these views, iterators and
 ;; entries; each family's carry its own JDK class names, by the map's tag.
 (define hm-families
@@ -1798,6 +1797,13 @@
     (cond ((string=? t "jx-weak-hashmap") "jx-whm-node") ((string=? t "jx-identity-hashmap") "jx-ihm-node") (else "jx-hm-node"))))
 (define (hm-node* m k g) (make-jhost (hm-node-tag m) (vector m k (hmv-ref m k) (hmn-gen* g k) g)))
 (define (hm-node m k) (hm-node* m k (hmn-track! m)))
+;; every entry of m in its order, as its entrySet's iterator hands them out: the
+;; seq of a HashMap (host-static-classes.ss hm-seq-entries), which skips making
+;; the view and picks the node class once
+(define (hm-node-list m)
+  (let ((g (hmn-track! m)) (tag (hm-node-tag m)) (t (hm-tbl m)))
+    (map (lambda (k) (make-jhost tag (vector m k (hashtable-ref t k jolt-nil) (hmn-gen* g k) g)))
+         (hm-keys-ordered m))))
 (define hmn-absent (list 'absent))
 (define (hmn-attached? st) (= (vector-ref st 3) (hmn-gen* (vector-ref st 4) (vector-ref st 1))))
 (define (hmn-value n)
