@@ -914,17 +914,63 @@
     (ctor-val src (ctor-shape src) k)))
 
 (defn- subst-lookup
-  "Replace every (:k nm)/(get nm :k) in node with the source value at k. The
-  caller guarantees (via local-escapes?) that nm is never rebound here and
-  appears only as a lookup subject, so no shadowing logic is needed."
-  [node nm src]
+  "Replace every (:k nm)/(get nm :k) in node with the source value at k, or with
+  the local hoisted maps k to. The caller guarantees (via local-escapes?) that nm
+  is never rebound here and appears only as a lookup subject, so no shadowing
+  logic is needed."
+  [node nm src hoisted]
   (let [k (lookup-key node nm)]
     (if k
-      (src-val src k)
+      (let [h (get hoisted k)] (if h h (src-val src k)))
       ;; the caller's escape check guarantees nm is never rebound below, so we
       ;; recurse uniformly into every child — leaving any lookup of nm
       ;; un-substituted would dangle.
-      (map-ir-children (fn [c] (subst-lookup c nm src)) node))))
+      (map-ir-children (fn [c] (subst-lookup c nm src hoisted)) node))))
+
+;; --- field values that make an object ----------------------------------------
+;; Moving a field value to its reads evaluates it once per read. For a number
+;; that is the same value; for a value that ALLOCATES it is a new object each
+;; time, where the struct held one: (let [m {:x [a]}] (identical? (:x m) (:x m)))
+;; was false, and a read in a loop body made one per iteration. Such a value is
+;; bound once to a fresh local where the struct was, and its reads read that.
+;; The local is a struct source in its own right when the value is a map or a
+;; record, so the fixpoint still scalar-replaces a nested Vec3 inside a Ray.
+
+(defn- allocates?
+  "Can evaluating node make an object that a second evaluation would not share?
+  Conservative: a collection literal, a fn literal, a host constructor or a record
+  ctor anywhere in node. A constant collection is hoisted by the back end, so a
+  :const is one object however often it is read."
+  [node]
+  (let [op (get node :op)]
+    (cond
+      (or (= op :vector) (= op :map) (= op :set) (= op :fn) (= op :host-new)) true
+      (ctor-shape node) true
+      :else (reduce-ir-children (fn [acc c] (or acc (allocates? c))) false node))))
+
+(defn- src-entries
+  "The [k value] fields of a struct source in evaluation order."
+  [src]
+  (if (= :map (get src :op))
+    (mapv (fn [pr] [(get (nth pr 0) :val) (nth pr 1)]) (get src :pairs))
+    (let [fields (get (ctor-shape src) :fields) args (get src :args)]
+      (mapv (fn [i] [(nth fields i) (nth args i)]) (range (count args))))))
+
+(defn- hoist-allocating
+  "[bindings hoisted]: a fresh binding for each field of src that is read (in
+  nodes) and whose value allocates, in source order, and the map from its key to
+  the :local that reads it."
+  [src nm nodes]
+  (let [acc (atom #{})]
+    (reduce (fn [_ n] (collect-keys! n nm acc) nil) nil nodes)
+    (reduce (fn [r e]
+              (let [k (nth e 0) v (nth e 1)]
+                (if (and (contains? @acc k) (not (get (nth r 1) k)) (allocates? v))
+                  (let [f (fresh (str nm "_" (name k)))]
+                    [(conj (nth r 0) [f v]) (assoc (nth r 1) k {:op :local :name f})])
+                  r)))
+            [[] {}]
+            (src-entries src))))
 
 ;; --- where a struct's field args may move to ---------------------------------
 ;; elim-let-structs MOVES each field arg from the let binding to every read of
@@ -1022,11 +1068,14 @@
                        (lookups-all-fields?
                          (conj (mapv (fn [bb] (nth bb 1)) (subvec binds (inc i) n)) body)
                          nm (get rs :fields))))
-            (let [head (subvec binds 0 i)
-                  tail (mapv (fn [bb] [(nth bb 0) (subst-lookup (nth bb 1) nm init)])
-                             (subvec binds (inc i) n))
+            (let [tail0 (subvec binds (inc i) n)
+                  hz (hoist-allocating init nm (conj (mapv (fn [bb] (nth bb 1)) tail0) body))
+                  hoisted (nth hz 1)
+                  head (reduce conj (subvec binds 0 i) (nth hz 0))
+                  tail (mapv (fn [bb] [(nth bb 0) (subst-lookup (nth bb 1) nm init hoisted)])
+                             tail0)
                   newbinds (reduce conj head tail)
-                  newbody (subst-lookup body nm init)]
+                  newbody (subst-lookup body nm init hoisted)]
               (mark!)
               (if (= 0 (count newbinds))
                 newbody

@@ -193,6 +193,18 @@
   (ok "a map a fn literal captures is not scalar-replaced into it" (has? e "amap-slots->pmap")))
 (let ((e (code-part (emitf "u" "(fn* ([a] (let [m {:x a :y 2}] (+ (:x m) (:y m)))))"))))
   (ok "a map read only in its own scope is still scalar-replaced" (not (has? e "amap-slots->pmap"))))
+;; Moving a value that allocates to two reads made two objects where the map
+;; held one: (identical? (:x m) (:x m)) was false, and a read in a loop body made
+;; one per iteration. The value is bound once instead (records: build-smoke.sh).
+(ok "a field read twice whose value allocates is read as one object"
+    (eq? #t (ev "((fn* ([a] (let [m {:x [a] :y 2}] (identical? (:x m) (:x m))))) 1)")))
+(ok "a field read once per loop iteration whose value allocates is one object"
+    (eq? #t (ev "((fn* ([a] (let [m {:x [a] :y 2}] (loop [i 0 prev (:x m)] (if (< i 2) (recur (inc i) (:x m)) (identical? prev (:x m))))))) 1)")))
+(let ((e (code-part (emitf "u" "(fn* ([a] (let [m {:x [a] :y 2}] (+ (count (:x m)) (:y m)))))"))))
+  (ok "a map with an allocating field is still scalar-replaced" (not (has? e "amap-slots->pmap"))))
+(let ((e (code-part (emitf "u" "(fn* ([a] (let [m {:x [a] :y (nil? a)}] (+ (count (:x m)) (if (:y m) 1 2) (if (:y m) 3 4)))))"))))
+  (ok "a non-allocating field read twice is still scalar-replaced" (not (has? e "amap-slots->pmap"))))
+(ok "a nested map read twice computes the same value" (= 4 (jnum->exact (ev "((fn* ([a] (let [m {:p {:x a :y 2} :q 1}] (+ (:x (:p m)) (:y (:p m)) (:q m))))) 1)"))))
 
 (set-optimize! #f)
 (set-direct-link-flag! #f)
