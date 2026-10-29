@@ -178,15 +178,6 @@
 ;; through to a miss instead of being refused.
 (define (rd-java-list? obj)
   (or (pvec? obj) (cseq? obj) (empty-list-t? obj) (jolt-lazyseq? obj)))
-;; The seq classes that implement IReduce on the JVM (class-hierarchy.ss): a
-;; PersistentList, Iterate, Cycle, Repeat, the ranges, and a vector's ChunkedSeq.
-;; A Cons or a LazySeq doesn't.
-(define (rd-ireduce-seq? obj)
-  (and (cseq? obj)
-       (or (cseqv? obj)
-           (let ((k (cseq-kind obj)))
-             (or (fx=? k sk-iterate) (fx=? k sk-cycle) (fx=? k sk-repeat)
-                 (fx=? k sk-long-range) (fx=? k sk-range) (fx=? k sk-list))))))
 (define (rd-java-set? obj)
   (or (pset? obj) (htable-sorted-set? obj)))
 (define (rd-persistent-coll? obj)
@@ -1057,12 +1048,17 @@
     ((string=? name "iterator") (list (make-jiterator (jolt-seq obj))))
     ;; (.spliterator coll): the host builds it (jutil-concurrent.ss on Chez)
     ((and (string=? name "spliterator") persistent-spliterator-hook) (list (persistent-spliterator-hook obj)))
-    ;; (.reduce coll f) / (.reduce coll f init): clojure.lang.IReduce — every
-    ;; persistent collection reduces itself on the JVM.
+    ;; (.reduce coll f) is clojure.lang.IReduce's, (.reduce coll f init)
+    ;; IReduceInit's, and which builtins have them is their class's answer
+    ;; (class-hierarchy.ss): a PersistentVector and its ChunkedSeq, a list, an
+    ;; array's or an array map's seq, the ranges, iterate, cycle and repeat. A
+    ;; StringSeq has only the init arity; a set, a map, a sorted coll's seq, a
+    ;; map's keys or vals, a ChunkedCons, a subvec or () has neither.
     ((string=? name "reduce")
-     (let ((k (dot-coll-kind-fast obj)))
-       (when (and k (not (eq? k 'vec)) (not (rd-ireduce-seq? obj)))
-         (no-method-throw name obj (length args))))
+     (when (and (dot-coll-kind-fast obj)
+                (not (rd-instance-of? (if (pair? (cdr args)) "clojure.lang.IReduceInit" "clojure.lang.IReduce")
+                                      obj)))
+       (no-method-throw name obj (length args)))
      (list (if (pair? (cdr args))
                (jolt-reduce (car args) (cadr args) obj)
                (jolt-reduce (car args) obj))))

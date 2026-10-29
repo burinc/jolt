@@ -2600,17 +2600,6 @@
       (empty-list-t? obj)
       (jolt-lazyseq? obj)))
 
-(define (rd-ireduce-seq? obj)
-  (and (cseq? obj)
-       (or (cseqv? obj)
-           (let ((k (cseq-kind obj)))
-             (or (fx=? k sk-iterate)
-                 (fx=? k sk-cycle)
-                 (fx=? k sk-repeat)
-                 (fx=? k sk-long-range)
-                 (fx=? k sk-range)
-                 (fx=? k sk-list))))))
-
 (define (rd-java-set? obj)
   (or (pset? obj) (htable-sorted-set? obj)))
 
@@ -3428,9 +3417,13 @@
           persistent-spliterator-hook)
      (list (persistent-spliterator-hook obj)))
     ((string=? name "reduce")
-     (let ((k (dot-coll-kind-fast obj)))
-       (when (and k (not (eq? k 'vec)) (not (rd-ireduce-seq? obj)))
-         (no-method-throw name obj (length args))))
+     (when (and (dot-coll-kind-fast obj)
+                (not (rd-instance-of?
+                       (if (pair? (cdr args))
+                           "clojure.lang.IReduceInit"
+                           "clojure.lang.IReduce")
+                       obj)))
+       (no-method-throw name obj (length args)))
      (list
        (if (pair? (cdr args))
            (jolt-reduce (car args) (cadr args) obj)
