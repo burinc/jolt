@@ -270,6 +270,8 @@
      "clojure.core/counted?"
     ;; the fn print form wraps the overlay __print1
     "clojure.core/__print1"
+    ;; load-reader (compile-eval.ss) drains its reader through slurp
+    "clojure.core/slurp"
     ;; the multimethod dispatch cache resolves the hierarchy value per call
     ;; (mm-current-hierarchy, multimethods.ss); mm-prefers? walks parents
     "clojure.core/global-hierarchy" "clojure.core/parents"
