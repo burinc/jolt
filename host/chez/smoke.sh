@@ -672,6 +672,17 @@ else
   echo "  FAIL: nrepl-server should delete its --port-file on the way out"
   fails=$((fails + 1))
 fi
+# a port file that cannot be written (its directory is missing) still starts
+# the server, and says so instead of starting as if nothing were wrong
+nr_start --port-file nodir/p.txt 0
+if grep -q 'started on port' "$nr_dir/out" && grep -q 'could not write nodir/p.txt' "$nr_dir/out" \
+   && ! grep -q 'p.txt written' "$nr_dir/out"; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: nrepl-server --port-file into a missing directory should warn: $(nr_why)"
+  fails=$((fails + 1))
+fi
+nr_stop
 if (cd "$nr_dir" && JOLT_PWD="$nr_dir" $jolt_timeout "$nr_jolt" nrepl-server --port-file </dev/null 2>&1) | grep -q -- '--port-file needs a path'; then
   pass=$((pass + 1))
 else
