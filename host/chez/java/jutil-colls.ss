@@ -227,6 +227,21 @@
     (let ((h (assoc (jhost-tag base) proxy-attach-hooks)))
       (when h ((cdr h) base p)))))
 
+;; ---- modCount ----------------------------------------------------------------
+;; A collection that counts structural changes (the ArrayList family, the
+;; HashMap / LinkedHashMap / TreeMap families and the sets and views over them)
+;; registers how to read the count, so the code they share — an iterator,
+;; subList, the spliterators, a stream's source — can watch any of them the same
+;; way. A view registers its backing map's count. jutil-modcount answers the
+;; count, or #f for a collection that keeps none.
+(define jutil-modcount-tbl (make-hashtable string-hash string=?))
+(define (register-modcount! tag f) (hashtable-set! jutil-modcount-tbl tag f))
+(define (jutil-modcount-reader x)
+  (and (jhost? x) (hashtable-ref jutil-modcount-tbl (jhost-tag x) #f)))
+(define (jutil-modcount x)
+  (let ((f (jutil-modcount-reader x))) (and f (f x))))
+(define (jutil-cme!) (throw-jvm 'ConcurrentModificationException jolt-nil))
+
 ;; ---- an Iterator whose remove writes through ---------------------------------------
 ;; (make-jutil-iterator tag items remove! [project]): walks ITEMS, a list taken
 ;; when the iterator is made; next() answers (project item) and remove() hands
@@ -234,61 +249,125 @@
 ;; the JDK's IllegalStateException. An item is whatever identifies an element to
 ;; its collection (an EnumMap's slot index, say). Each tag is one JDK iterator
 ;; class (classes follow tags); register-jutil-iterator! declares one.
-;; State: #(remaining last remove! project)
+;;
+;; (make-jutil-ff-iterator tag items remove! project mcv mci) is the fail-fast one
+;; HashMap$HashIterator and LinkedHashMap$LinkedHashIterator are: it remembers
+;; the modCount its collection keeps in slot MCI of the vector MCV (the hash
+;; table's state, a LinkedHashMap's chain), and next checks it before anything
+;; else (then the end),
+;; remove checks it after the IllegalStateException and takes the new count
+;; after removing. hasNext never checks. The walk is the snapshot ITEMS, which is
+;; what the live walk hands out for as long as the count holds, and next throws
+;; the first time it does not (tools/failfast-model.pl checks the protocol).
+;; State: #(remaining last remove! project mcv mci expected); mcv is #f for an
+;; iterator that watches no count.
 (define jutil-iterator-none (list 'none))
-;; ---- modCount ----------------------------------------------------------------
-;; The lists that count structural changes (ArrayList, LinkedList, Vector)
-;; register how to read the count, so the code they share — subList, the
-;; spliterators, a stream's source — can watch any of them the same way.
-;; jutil-modcount answers the count, or #f for a list that keeps none.
-(define jutil-modcount-tbl (make-hashtable string-hash string=?))
-(define (register-modcount! tag f) (hashtable-set! jutil-modcount-tbl tag f))
-(define (jutil-modcount x)
-  (and (jhost? x) (let ((f (hashtable-ref jutil-modcount-tbl (jhost-tag x) #f))) (and f (f x)))))
-(define (jutil-cme!) (throw-jvm 'ConcurrentModificationException jolt-nil))
-
+(define (jutil-identity x) x)
 (define (make-jutil-iterator tag items remove! . project)
   (make-jhost tag (vector items jutil-iterator-none remove!
-                          (if (pair? project) (car project) (lambda (x) x)))))
+                          (if (pair? project) (jutil-project-slot (car project)) #f) #f 0 0)))
+(define (make-jutil-ff-iterator tag items remove! project mcv mci)
+  (make-jhost tag (vector items jutil-iterator-none remove! (jutil-project-slot project) mcv mci (vector-ref mcv mci))))
+;; slot 3 holds #f for the identity projection, which next then skips calling
+(define (jutil-project-slot p) (if (eq? p jutil-identity) #f p))
+(define-syntax jutil-project
+  (syntax-rules ()
+    ((_ st x) (let ((p (vector-ref st 3))) (if p (p x) x)))))
+;; is the count still the one expected (always, for one that watches none);
+;; inline, as next pays it per element
+(define-syntax jutil-iterator-current?
+  (syntax-rules ()
+    ((_ st) (let ((v (vector-ref st 4)))
+              (or (not v) (fx=? (vector-ref st 6) (vector-ref v (vector-ref st 5))))))))
 (define (jutil-iterator-next self)
   (let* ((st (jhost-state self)) (xs (vector-ref st 0)))
+    (unless (jutil-iterator-current? st) (jutil-cme!))
     (when (null? xs) (throw-jvm 'NoSuchElementException jolt-nil))
-    (vector-set! st 0 (cdr xs))
-    (vector-set! st 1 (car xs))
-    ((vector-ref st 3) (car xs))))
+    (let ((x (car xs)))
+      (vector-set! st 0 (cdr xs))
+      (vector-set! st 1 x)
+      (jutil-project st x))))
 (define jutil-iterator-methods
   (list (cons "hasNext" (lambda (self) (pair? (vector-ref (jhost-state self) 0))))
         (cons "next" jutil-iterator-next)
         (cons "remove" (lambda (self)
                          (let* ((st (jhost-state self)) (x (vector-ref st 1)))
                            (when (eq? x jutil-iterator-none) (throw-jvm 'IllegalStateException jolt-nil))
+                           (unless (jutil-iterator-current? st) (jutil-cme!))
                            (vector-set! st 1 jutil-iterator-none)
                            ((vector-ref st 2) x)
+                           (let ((v (vector-ref st 4)))
+                             (when v (vector-set! st 6 (vector-ref v (vector-ref st 5)))))
                            jolt-nil)))
+        ;; Iterator's default: hasNext and next until the end, so a change the
+        ;; action makes is caught at the next element
         (cons "forEachRemaining" (lambda (self f)
-                                   (let* ((st (jhost-state self)) (xs (vector-ref st 0)))
-                                     (vector-set! st 0 '())
-                                     (unless (null? xs) (vector-set! st 1 (list-ref xs (fx- (length xs) 1))))
-                                     (for-each (lambda (x) (jolt-fi-call f "accept" ((vector-ref st 3) x))) xs)
-                                     jolt-nil)))))
+                                   (when (jolt-nil? f) (throw-jvm 'NullPointerException jolt-nil))
+                                   (let loop ()
+                                     (when (pair? (vector-ref (jhost-state self) 0))
+                                       (jolt-fi-call f "accept" (jutil-iterator-next self))
+                                       (loop)))
+                                   jolt-nil))))
 (define jutil-iterator-tags '())
 (define (jutil-iterator? x) (and (jhost? x) (member (jhost-tag x) jutil-iterator-tags) #t))
+;; iterator-seq's chunk: up to 32 nexts at once; a count that moved is the
+;; loop's to report
 (define (jutil-iterator-fill it buf)
-  (let* ((st (jhost-state it)) (project (vector-ref st 3)))
-    (let loop ((j 0) (xs (vector-ref st 0)) (last (vector-ref st 1)))
-      (if (or (fx=? j 32) (null? xs))
-          (begin (vector-set! st 0 xs) (vector-set! st 1 last) j)
-          (begin (vector-set! buf j (project (car xs)))
-                 (loop (fx+ j 1) (cdr xs) (car xs)))))))
+  (let* ((st (jhost-state it)) (project (or (vector-ref st 3) jutil-identity)))
+    (and (jutil-iterator-current? st)
+         (let loop ((j 0) (xs (vector-ref st 0)) (last (vector-ref st 1)))
+           (if (or (fx=? j 32) (null? xs))
+               (begin (vector-set! st 0 xs) (vector-set! st 1 last) j)
+               (begin (vector-set! buf j (project (car xs)))
+                      (loop (fx+ j 1) (cdr xs) (car xs))))))))
 (define (register-jutil-iterator! tag)
   (set! jutil-iterator-tags (cons tag jutil-iterator-tags))
   (register-host-methods! tag jutil-iterator-methods)
   (register-iterator-seq-fill! (list tag) jutil-iterator-fill jutil-iterator-next))
-;; (iterator-seq it) / (seq it): what the iterator has not handed out yet
+;; (seq it): what the iterator has not handed out yet
 (register-seq-arm! jutil-iterator?
   (lambda (it)
     (let ((st (jhost-state it)))
-      (if (null? (vector-ref st 0)) jolt-nil (list->cseq (map (vector-ref st 3) (vector-ref st 0)))))))
+      (if (null? (vector-ref st 0)) jolt-nil (list->cseq (map (or (vector-ref st 3) jutil-identity) (vector-ref st 0)))))))
+
+;; (jutil-ff-seq coll xs): (seq coll) over XS, the elements COLL's fail-fast
+;; iterator hands out, 32 at a time as RT.chunkIteratorSeq realizes them: the
+;; first chunk now (a jolt seq is realized at its head), each later one when the
+;; walk reaches it — a ConcurrentModificationException then if COLL's modCount
+;; has moved since the seq was made, as the iterator's next would raise.
+(define (jutil-ff-seq coll xs)
+  (let* ((mc (jutil-modcount-reader coll)) (e (and mc (mc coll))))
+    (define (chunk xs)
+      (let loop ((xs xs) (i 0))
+        (cond ((null? xs) jolt-nil)
+              ((fx=? i 32) (later xs))
+              (else (cseq-realized (car xs) (loop (cdr xs) (fx+ i 1)))))))
+    (define (later xs)
+      (jolt-make-lazy-seq
+        (lambda ()
+          (when (and mc (not (eqv? e (mc coll)))) (jutil-cme!))
+          (chunk xs))))
+    (if (null? xs) jolt-nil (chunk xs))))
+
+;; ---- the default Collection walks over a fail-fast iterator ----------------------
+;; Iterable.forEach and Collection.removeIf as the JDK's defaults run them: one
+;; iterator, hasNext / next per element, removeIf removing through it. A change
+;; the action makes is the next next()'s ConcurrentModificationException.
+(define (jutil-walk-for-each it f)
+  (when (jolt-nil? f) (throw-jvm 'NullPointerException jolt-nil))
+  (let ((next (host-method-ref (jhost-tag it) "next")) (has? (host-method-ref (jhost-tag it) "hasNext")))
+    (let loop () (when (has? it) (jolt-fi-call f "accept" (next it)) (loop))))
+  jolt-nil)
+(define (jutil-walk-remove-if it pred)
+  (when (jolt-nil? pred) (throw-jvm 'NullPointerException jolt-nil))
+  (let ((next (host-method-ref (jhost-tag it) "next")) (has? (host-method-ref (jhost-tag it) "hasNext"))
+        (rm (host-method-ref (jhost-tag it) "remove")))
+    (let loop ((removed #f))
+      (if (has? it)
+          (if (jolt-truthy? (jolt-fi-call pred "test" (next it)))
+              (begin (rm it) (loop #t))
+              (loop removed))
+          removed))))
 
 ;; ---- java.util.Map$Entry host objects ----------------------------------------------
 ;; An entry a java.util shim hands out (TreeMap$Entry, SimpleImmutableEntry)

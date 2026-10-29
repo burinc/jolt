@@ -911,7 +911,12 @@
 (def-var! "clojure.core" "PrintWriter-on" jolt-print-writer-on)
 
 ;; ---- java.util.HashMap ------------------------------------------------------
-;; A mutable map keyed by jolt values (jolt-hash / jolt=2). State #(chez-hashtable).
+;; A mutable map keyed by jolt values (jolt-hash / jolt=2). State
+;; #(chez-hashtable key-order modcount) — a Properties adds its defaults and
+;; writethrough after them. Slot 2 is HashMap's modCount: a new key, a removed
+;; key and every clear (an empty map's too) bump it; a put over an existing key
+;; does not. The fail-fast views' iterators, forEach, replaceAll, the compute
+;; family and the HashSet over the same storage watch it (jolt-i6iwq).
 ;; Constructors: () | (capacity) | (capacity load-factor) [sizing args ignored] |
 ;; (Map m) [copy]. Enough of the Map surface for libraries that build a fast lookup
 ;; (malli's fast-registry: (doto (HashMap. 1024 0.25) (.putAll m)) then .get).
@@ -923,6 +928,13 @@
 ;; deterministic superset jolt's small maps already use).
 (define (hm-ord self) (vector-ref (jhost-state self) 1))
 (define (hm-ord! self v) (vector-set! (jhost-state self) 1 v))
+(define (hm-state tbl ord) (vector tbl ord 0))
+(define (hm-mc self) (vector-ref (jhost-state self) 2))
+(define-syntax hm-bump!
+  ;; inline: every new key and every removal pays it
+  (syntax-rules ()
+    ((_ self) (let ((st (jhost-state self)))
+                (vector-set! st 2 (fxand (fx+ (vector-ref st 2) 1) #x3fffffff))))))
 ;; A WeakHashMap's table is weak, so it cannot keep its keys in a list: its slot
 ;; holds a version token instead, a fresh one per structural change (what a
 ;; view's iterator checks), and its keys come from the table, in the table's
@@ -930,6 +942,7 @@
 (define (hm-weak? self) (hashtable-weak? (hm-tbl self)))
 (define (hm-note-key! self k)
   (when (not (hashtable-contains? (hm-tbl self) k))
+    (hm-bump! self)
     (hm-ord! self (if (hm-weak? self) (list 'v) (cons k (hm-ord self))))))
 ;; values compare as the map's keys do: by identity in an IdentityHashMap
 (define (hm-veq? self a b)
@@ -946,12 +959,14 @@
 (define hm-detach-hook #f)
 (define (hm-drop-key! self k)
   (when hm-detach-hook (hm-detach-hook self k))
+  (hm-bump! self)
   ;; by the table's own key equivalence: two equal keys are two keys in an IdentityHashMap
   (hm-ord! self (if (hm-weak? self) (list 'v)
                     (let ((same? (hashtable-equivalence-function (hm-tbl self))))
                       (remove (lambda (e) (same? e k)) (hm-ord self))))))
 (define (hm-clear! self)
   (when hm-detach-hook (hm-detach-hook self hm-detach-hook))
+  (hm-bump! self)
   (hashtable-clear! (hm-tbl self))
   (hm-ord! self (if (hm-weak? self) (list 'v) '())))
 (define (hm-keys-ordered self)
@@ -992,7 +1007,7 @@
 (register-class-ctor! "HashMap"
   (lambda args
     (let* ((ht (make-hashtable hm-hash jolt=2))
-           (self (make-jhost "hashmap" (vector ht '()))))
+           (self (make-jhost "hashmap" (hm-state ht '()))))
       (when (and (pair? args) (not (number? (car args))))
         (hm-copy-into-ordered! self (car args)))
       self)))
@@ -1001,6 +1016,39 @@
     (for-each (lambda (k) (set! m (jolt-assoc m k (hashtable-ref (hm-tbl self) k jolt-nil))))
               (hm-keys-ordered self))
     m))
+;; How a HashMap-shaped map's own walks and compute methods answer a change
+;; made under them: a HashMap checks its modCount once a forEach / replaceAll
+;; walk ends and around each compute-family function; an IdentityHashMap and a
+;; WeakHashMap after every element (their compute methods are Map's defaults,
+;; which check nothing); a ConcurrentHashMap and a Properties never.
+(define (hm-ff-kind self)
+  (let ((t (jhost-tag self)))
+    (cond ((string=? t "hashmap") 'end)
+          ((or (string=? t "jx-weak-hashmap") (string=? t "jx-identity-hashmap")) 'step)
+          (else #f))))
+;; (f k v) over the map in its order. Under a HashMap's walk a key removed by
+;; an earlier call is not reached, as the JDK's table walk does not reach an
+;; unlinked node.
+(define (hm-walk self f)
+  (let ((kind (hm-ff-kind self)) (t (hm-tbl self)) (mc (hm-mc self)))
+    (for-each (lambda (k)
+                (case kind
+                  ((end) (when (or (fx=? mc (hm-mc self)) (hashtable-contains? t k))
+                           (f k (hashtable-ref t k jolt-nil))))
+                  ((step) (f k (hashtable-ref t k jolt-nil))
+                          (unless (fx=? mc (hm-mc self)) (jutil-cme!)))
+                  (else (f k (hashtable-ref t k jolt-nil)))))
+              (hm-keys-ordered self))
+    (when (and (eq? kind 'end) (not (fx=? mc (hm-mc self)))) (jutil-cme!))
+    jolt-nil))
+;; a HashMap's compute family: a function that changed the map's structure is
+;; a ConcurrentModificationException once it returns
+(define (hm-apply-checked self f method . args)
+  (if (eq? (hm-ff-kind self) 'end)
+      (let* ((mc (hm-mc self)) (v (apply jolt-fi-call f method args)))
+        (unless (fx=? mc (hm-mc self)) (jutil-cme!))
+        v)
+      (apply jolt-fi-call f method args)))
 ;; jolt-fi-call (records-dispatch.ss) calls the java.util.function argument.
 (define hashmap-methods
   (list (cons "put" (lambda (self k v) (let ((old (hashtable-ref (hm-tbl self) k jolt-nil)))
@@ -1022,7 +1070,7 @@
         (cons "computeIfAbsent" (lambda (self k f)
           (let ((old (hashtable-ref (hm-tbl self) k jolt-nil)))
             (if (jolt-nil? old)
-                (let ((v (jolt-fi-call f "apply" k)))
+                (let ((v (hm-apply-checked self f "apply" k)))
                   (unless (jolt-nil? v)
                     (hm-note-key! self k)
                     (hashtable-set! (hm-tbl self) k v))
@@ -1032,13 +1080,13 @@
           (let ((old (hashtable-ref (hm-tbl self) k jolt-nil)))
             (if (jolt-nil? old)
                 jolt-nil
-                (let ((v (jolt-fi-call f "apply" k old)))
+                (let ((v (hm-apply-checked self f "apply" k old)))
                   (if (jolt-nil? v)
                       (begin (hashtable-delete! (hm-tbl self) k) (hm-drop-key! self k) jolt-nil)
                       (begin (hashtable-set! (hm-tbl self) k v) v)))))))
         (cons "compute" (lambda (self k f)
           (let* ((old (hashtable-ref (hm-tbl self) k jolt-nil))
-                 (v (jolt-fi-call f "apply" k old)))
+                 (v (hm-apply-checked self f "apply" k old)))
             (cond ((not (jolt-nil? v))
                    (hm-note-key! self k) (hashtable-set! (hm-tbl self) k v) v)
                   ;; a nil result removes a key that is present, mapped to nil included
@@ -1046,7 +1094,7 @@
                   (else (hashtable-delete! (hm-tbl self) k) (hm-drop-key! self k) jolt-nil)))))
         (cons "merge" (lambda (self k v f)
           (let* ((old (hashtable-ref (hm-tbl self) k jolt-nil))
-                 (v (if (jolt-nil? old) v (jolt-fi-call f "apply" old v))))
+                 (v (if (jolt-nil? old) v (hm-apply-checked self f "apply" old v))))
             (cond ((not (jolt-nil? v)) (hm-note-key! self k) (hashtable-set! (hm-tbl self) k v) v)
                   ;; an absent key stays absent, the key order untouched
                   ((not (hashtable-contains? (hm-tbl self) k)) jolt-nil)
@@ -1060,16 +1108,15 @@
                 (hashtable-set! (hm-tbl self) k v) old)
               jolt-nil)))
         (cons "forEach" (lambda (self f)
-          (for-each (lambda (k) (jolt-fi-call f "accept" k (hashtable-ref (hm-tbl self) k jolt-nil)))
-                    (hm-keys-ordered self))
-          jolt-nil))
-        ;; Map.replaceAll(BiFunction): every value becomes f(key, value)
+          (hm-walk self (lambda (k v) (jolt-fi-call f "accept" k v)))))
+        ;; Map.replaceAll(BiFunction): every value becomes f(key, value); a key
+        ;; the function removed stays removed
         (cons "replaceAll" (lambda (self f)
-          (for-each (lambda (k)
-                      (hashtable-set! (hm-tbl self) k
-                                      (jolt-fi-call f "apply" k (hashtable-ref (hm-tbl self) k jolt-nil))))
-                    (hm-keys-ordered self))
-          jolt-nil))
+          (let ((t (hm-tbl self)) (mc (hm-mc self)))
+            (hm-walk self (lambda (k v)
+                            (let ((nv (jolt-fi-call f "apply" k v)))
+                              (when (or (fx=? mc (hm-mc self)) (hashtable-contains? t k))
+                                (hashtable-set! t k nv))))))))
         (cons "containsKey" (lambda (self k) (if (hashtable-contains? (hm-tbl self) k) #t #f)))
         (cons "containsValue" (lambda (self v)
           (let ((found #f))
@@ -1091,7 +1138,7 @@
                                          (begin (hashtable-delete! (hm-tbl self) k) (hm-drop-key! self k) #t)
                                          #f))))
         (cons "clone" (lambda (self)
-                        (let ((m (make-jhost (jhost-tag self) (vector (hm-like-table self) (if (hm-weak? self) (list 'v) '())))))
+                        (let ((m (make-jhost (jhost-tag self) (hm-state (hm-like-table self) (if (hm-weak? self) (list 'v) '())))))
                           (hm-copy-into-ordered! m self)
                           m)))
         (cons "clear" (lambda (self) (hm-clear! self) jolt-nil))
@@ -1123,14 +1170,14 @@
 ;; reads them through the Properties API saw nothing.
 (define (make-properties-jhost . defaults)
   (make-jhost "properties"
-              (vector (make-hashtable hm-hash jolt=2) (quote ())
+              (vector (make-hashtable hm-hash jolt=2) (quote ()) 0
                       (if (pair? defaults) (car defaults) #f)
                       #f)))
 (define (props-slot self i)
   (let ((st (jhost-state self)))
     (and (fx>? (vector-length st) i) (vector-ref st i))))
-(define (props-defaults self) (props-slot self 2))
-(define (props-writethrough self) (props-slot self 3))
+(define (props-defaults self) (props-slot self 3))
+(define (props-writethrough self) (props-slot self 4))
 ;; getProperty answers only STRING values, as on the JVM: a non-string mapping is
 ;; invisible to it (get still sees it) and the default is returned instead. The
 ;; defaults are themselves searched by getProperty, so a Properties whose
@@ -1206,7 +1253,7 @@
 ;; going through to the override store.
 (define (make-system-properties m override-tbl)
   (let ((self (make-jhost "properties"
-                          (vector (make-hashtable hm-hash jolt=2) (quote ()) #f override-tbl))))
+                          (vector (make-hashtable hm-hash jolt=2) (quote ()) 0 #f override-tbl))))
     (for-each (lambda (e)
                 (hm-note-key! self (jolt-nth e 0))
                 (hashtable-set! (hm-tbl self) (jolt-nth e 0) (jolt-nth e 1)))
@@ -1219,7 +1266,7 @@
 ;; (jutil-concurrent.ss). (get a-chm k) reads the map (clojure.core/get).
 (define (make-chm-jhost . args)
   (let* ((ht (make-hashtable hm-hash jolt=2))
-         (self (make-jhost "chm" (vector ht '()))))
+         (self (make-jhost "chm" (hm-state ht '()))))
     (when (and (pair? args) (not (number? (car args))))
       (hm-copy-into-ordered! self (car args)))
     self))
@@ -1245,7 +1292,7 @@
 ;; hashtables hold their keys weakly under jolt's own hash and equality), so an
 ;; entry whose key nothing else holds goes at the next collection, as on the JDK.
 (define (make-weak-hashmap-jhost . args)
-  (let ((self (make-jhost "jx-weak-hashmap" (vector (make-weak-hashtable hm-hash jolt=2) (list 'v)))))
+  (let ((self (make-jhost "jx-weak-hashmap" (hm-state (make-weak-hashtable hm-hash jolt=2) (list 'v)))))
     (when (and (pair? args) (not (number? (car args)))) (hm-copy-into-ordered! self (car args)))
     self))
 (register-class-ctor! "WeakHashMap" make-weak-hashmap-jhost)
@@ -1254,7 +1301,7 @@
 ;; where the JDK compares one (containsValue, remove(k, v)) — is matched by
 ;; reference, as == matches it.
 (define (make-identity-hashmap-jhost . args)
-  (let ((self (make-jhost "jx-identity-hashmap" (vector (make-eq-hashtable) '()))))
+  (let ((self (make-jhost "jx-identity-hashmap" (hm-state (make-eq-hashtable) '()))))
     (when (and (pair? args) (not (number? (car args)))) (hm-copy-into-ordered! self (car args)))
     self))
 (register-class-ctor! "IdentityHashMap" make-identity-hashmap-jhost)
@@ -1444,7 +1491,7 @@
 (define (hs-ctor tag)
   (lambda args
     (let* ((ht (make-hashtable hm-hash jolt=2))
-           (self (make-jhost tag (vector ht '()))))
+           (self (make-jhost tag (hm-state ht '()))))
       (when (and (pair? args) (not (number? (car args))))
         (for-each (lambda (e)
                     (hm-note-key! self e)
@@ -1462,7 +1509,7 @@
                  (string-append "Negative number of " what ": " (jolt-str-render-one n))))
     (make)))
 (register-class-statics! "java.util.HashMap"
-  (list (cons "newHashMap" (hm-sized-new "mappings" (lambda () (make-jhost "hashmap" (vector (make-hashtable hm-hash jolt=2) '())))))))
+  (list (cons "newHashMap" (hm-sized-new "mappings" (lambda () (make-jhost "hashmap" (hm-state (make-hashtable hm-hash jolt=2) '())))))))
 (register-class-statics! "java.util.HashSet"
   (list (cons "newHashSet" (hm-sized-new "elements" (lambda () ((hs-ctor "hashset")))))))
 ;; the linked subclasses inherit them
@@ -1475,9 +1522,10 @@
   (list (cons "add" (lambda (self x) (let ((had (hashtable-contains? (hm-tbl self) x)))
                                         (hm-note-key! self x)
                                         (hashtable-set! (hm-tbl self) x #t) (not had))))
-        (cons "remove" (lambda (self x) (let ((had (hashtable-contains? (hm-tbl self) x)))
-                                           (hashtable-delete! (hm-tbl self) x)
-                                           (hm-drop-key! self x) (if had #t #f))))
+        ;; an absent element changes nothing, the modCount included
+        (cons "remove" (lambda (self x) (and (hashtable-contains? (hm-tbl self) x)
+                                             (begin (hashtable-delete! (hm-tbl self) x)
+                                                    (hm-drop-key! self x) #t))))
         (cons "contains" (lambda (self x) (if (hashtable-contains? (hm-tbl self) x) #t #f)))
         (cons "addAll" (lambda (self c)
                          (fold-left (lambda (ch x)
@@ -1501,10 +1549,8 @@
                                                (begin (hashtable-delete! (hm-tbl self) x) (hm-drop-key! self x) #t)))
                                          #f (hs->list self)))))
         (cons "clone" (lambda (self) ((hs-ctor (jhost-tag self)) (list->cseq (hs->list self)))))
-        (cons "iterator" (lambda (self)
-                           (make-jutil-iterator "hashset-iterator" (hs->list self)
-                                                (lambda (x) (hashtable-delete! (hm-tbl self) x)
-                                                            (hm-drop-key! self x)))))
+        ;; HashMap$KeyIterator: fail-fast over the set's modCount
+        (cons "iterator" (lambda (self) (hs-iterator self)))
         (cons "size" (lambda (self) (hashtable-size (hm-tbl self))))
         (cons "isEmpty" (lambda (self) (= 0 (hashtable-size (hm-tbl self)))))
         (cons "clear" (lambda (self) (hm-clear! self) jolt-nil))
@@ -1513,17 +1559,46 @@
         ;; found: toArray for class java.util.HashSet". Same jcoll-to-array the
         ;; ArrayList family uses, over the set's own iteration order.
         (cons "toArray" (lambda (self . args) (jcoll-to-array (hs->list self) args)))
-        (cons "forEach" (lambda (self f) (jcoll-for-each (hs->list self) f)))
-        (cons "removeIf" (lambda (self pred)
-                           (let* ((xs (hs->list self)) (keep (jcoll-keep xs pred)))
-                             (for-each (lambda (x)
-                                         (unless (memq x keep)
-                                           (hashtable-delete! (hm-tbl self) x)
-                                           (hm-drop-key! self x)))
-                                       xs)
-                             (not (fx=? (length keep) (length xs))))))))
+        ;; Iterable.forEach and Collection.removeIf, the defaults HashSet keeps:
+        ;; over its iterator, so a change the action makes is caught at the
+        ;; next element
+        (cons "forEach" (lambda (self f) (jutil-walk-for-each (hs-iterator self) f)))
+        (cons "removeIf" (lambda (self pred) (jutil-walk-remove-if (hs-iterator self) pred)))))
+(define (hs-iterator self)
+  (make-jutil-ff-iterator "hashset-iterator" (hs->list self)
+                          (lambda (x) (hashtable-delete! (hm-tbl self) x) (hm-drop-key! self x))
+                          jutil-identity (jhost-state self) 2))
 (register-jutil-iterator! "hashset-iterator")
-(register-seq-arm! hs-hashset? (lambda (x) (list->cseq (hs->list x))))
+;; The fail-fast iterators of the HashSet and the LinkedHashMap / LinkedHashSet
+;; families step with the state's slots read unchecked: their state is always
+;; the 7-slot vector make-jutil-ff-iterator builds (jutil-colls.ss, which is
+;; shared with targets that have no unchecked access), and next is the hot
+;; path of every walk over them.
+(define (jutil-ff-next self)
+  (let* ((st (jhost-state self)) (xs (#3%vector-ref st 0)) (v (#3%vector-ref st 4)))
+    (unless (fx=? (#3%vector-ref st 6) (vector-ref v (#3%vector-ref st 5))) (jutil-cme!))
+    (when (null? xs) (throw-jvm 'NoSuchElementException jolt-nil))
+    (let ((x (car xs)) (p (#3%vector-ref st 3)))
+      (#3%vector-set! st 0 (cdr xs))
+      (#3%vector-set! st 1 x)
+      (if p (p x) x))))
+(for-each (lambda (tag)
+            (register-host-methods! tag (list (cons "next" jutil-ff-next)))
+            (register-iterator-seq-fill! (list tag) jutil-iterator-fill jutil-ff-next))
+          '("hashset-iterator" "lhs-iterator" "lhm-keyset-iterator" "lhm-values-iterator" "lhm-entryset-iterator"))
+;; reduce over a fail-fast collection walks its iterator (seq.ss
+;; jolt-reduce-iter-hook); a Map is no Iterable and reduces over its seq
+(set! jolt-reduce-iter-hook
+  (lambda (x)
+    (and (jutil-modcount x)
+         (not (eq? (jutil-coll-kind x) 'map))
+         (host-method-ref (jhost-tag x) "iterator")
+         (record-method-dispatch x "iterator" jolt-nil))))
+(register-modcount! "hashset" hm-mc)
+(register-modcount! "hashmap" hm-mc)
+(register-modcount! "jx-weak-hashmap" hm-mc)
+(register-modcount! "jx-identity-hashmap" hm-mc)
+(register-seq-arm! hs-hashset? (lambda (x) (jutil-ff-seq x (hs->list x))))
 
 ;; the HashMap family and HashSet are a java.util.Map / Set to =, hash, pr, str
 ;; and reduce-kv (java/jutil-colls.ss), in their insertion order. An ArrayList
@@ -3748,7 +3823,7 @@
             (else 'pass)))
         'pass)))
 ;; (seq a-HashMap) walks its entries, like RT.seqFrom over a java.util.Map.
-(register-seq-arm! hm-hashmap? (lambda (x) (jolt-seq (hm->pmap x))))
+(register-seq-arm! hm-hashmap? (lambda (x) (jutil-ff-seq x (seq->list (jolt-seq (hm->pmap x))))))
 ;; Which shims are Iterable (seqable?) is the java.util registry's answer
 ;; (jutil-colls.ss jhost-seqable-shim?): every shim above registers there.
 ;; a MapEntry does not carry meta on the JVM (AMapEntry); deny IObj/IMeta so the

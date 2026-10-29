@@ -191,6 +191,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **HashSet, LinkedHashSet, TreeSet, the LinkedHashMap and TreeMap views and
+  their iterators are fail-fast** (jolt-i6iwq). HashMap, LinkedHashMap and
+  TreeMap keep the JDK's modCount, bumped by the same operations (a new key, a
+  removal, every clear, an access-order move; not a put over an existing key),
+  and the iterators, `forEach`, `removeIf`, `replaceAll`, the compute family,
+  spliterators, streams, `iterator-seq`, a chunked `seq` and `reduce` raise
+  `ConcurrentModificationException` where the JDK's do. TreeMap's iterators
+  check the end before the count, as the JDK's do; a TreeMap values iterator
+  reads the current value; TreeMap's and LinkedHashSet's spliterators bind at
+  first use. `reduce` over any fail-fast collection, lists included, walks its
+  iterator.
+
 - `(String. s)` returned `s` itself; it is a new string, and `(String.)` is
   `""`.
 - The per-thread string hash cache held up to 2048 strings strongly; it is

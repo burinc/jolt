@@ -1712,13 +1712,13 @@
            :jolt "true"}
    :note "A non-empty (String. s) is a fresh copy on both."}
   {:category :host-model
-   :behavior "when seq of an ArrayList reads its first chunk"
+   :behavior "when seq of a fail-fast java.util collection (an ArrayList, a HashSet, a TreeMap, …) reads its first chunk"
    :jvm "at first use (RT.seq answers an unrealized LazySeq)"
    :jolt "when seq is called"
    :check {:expr "(let [l (java.util.ArrayList. [1 2 3]) s (seq l)] (.add l 4) (try (vec s) (catch java.util.ConcurrentModificationException _ :cme)))"
            :jvm ":cme"
            :jolt "[1 2 3]"}
-   :note "A jolt seq is realized at its head. Later chunks are read when the walk reaches them, as on the JVM, so a list changed under doseq or reduce raises the same way."}
+   :note "A jolt seq is realized at its head. Later chunks are read when the walk reaches them, as on the JVM, so a list, set or map changed under doseq raises the same way; reduce walks the collection's iterator, as iter-reduce does."}
   {:category :integer-box-model
    :behavior "an IdentityHashMap keyed by equal longs"
    :jvm "two keys when they are distinct boxes (outside the Long cache)"

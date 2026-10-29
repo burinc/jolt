@@ -27,6 +27,29 @@
 %   bound_first    next checks the bound before the count        -> dirty miss
 %   hasnext_checks hasNext checks the count                      -> hasNext throws
 %
+% Part 3, the hash and tree families (HashMap / HashSet / LinkedHashMap /
+% LinkedHashSet / TreeMap / TreeSet and their views): a modCount on the map
+% and an iterator that walks a SNAPSHOT of the keys taken when it is made,
+% #(remaining lastRet expected). Bump rules (the JDK's): a put / add of a new
+% key, a remove of a present one and every clear bump the count; a put over an
+% existing key, a remove of an absent one do not. next checks the count, then
+% the end (HashMap$HashIterator) or the end, then the count
+% (TreeMap$PrivateEntryIterator); remove checks lastRet, then the count, then
+% removes and takes the new count. Checked over every sequence of iterator
+% steps and foreign puts / removes / clears up to a bound against a ghost:
+%   clean      no foreign structural change yet: what was handed out and kept,
+%              then the snapshot's remainder, is exactly the live collection in
+%              its order (the snapshot walk IS the live walk), and next never
+%              throws a CME
+%   dirty      next throws CME (the tree's: unless the snapshot is used up, where
+%              it is NoSuchElementException), remove after a next throws CME
+% Mutants that must be caught:
+%   put_existing_bumps  a put over an existing key bumps        -> clean CME
+%   absent_remove_bumps a remove of an absent key bumps          -> clean CME
+%   no_clear_bump       a clear of an empty map does not bump   -> dirty miss
+%   ff_no_resync        remove does not take the new count       -> clean CME
+%   tree_count_first    the tree checks the count before the end -> wrong error
+%
 % Part 2, ArrayDeque: a ring buffer, as the JDK's (no modCount). State
 % d(Slots, Head, Tail): nil marks an empty slot; it is full when an add makes
 % Head = Tail, which grows it at once (capacity c -> c + c + 2 below 64), with a
@@ -146,6 +169,61 @@ reach_end(Kind, S0, D, Why) :-
 bad1(Kind, Why) :- kind(Kind), member(N, [0,1,2,3]), init1(N, S0), explore1(Kind, S0, 5, Why).
 bad1(Kind, Why) :- kind(Kind), end_check(Kind, Why).
 
+% ================================================================ part 3
+% s3(Live, MC, Remaining, LastRet, Exp, Clean, Kept); keys are 0..2, Live keeps
+% insertion order for a hash family (hash) and key order for a tree (tree).
+fam(hash). fam(tree).
+ins(hash, K, L, L1) :- append(L, [K], L1).
+ins(tree, K, L, L1) :- msort([K|L], L1).
+
+ff_next(Fam, Rem, Exp, MC, R) :-
+    (   Fam == tree, \+ mutant(tree_count_first)
+    ->  ( Rem == [] -> R = nsee ; Exp =\= MC -> R = cme ; R = go )
+    ;   ( Exp =\= MC -> R = cme ; Rem == [] -> R = nsee ; R = go ) ).
+
+step3(Fam, next, s3(L,MC,Rem,LR,Exp,Cl,K), S, R) :-
+    ff_next(Fam, Rem, Exp, MC, R0),
+    (   R0 == go
+    ->  Rem = [X|Rem1], append(K, [X], K1), R = val(X),
+        S = s3(L,MC,Rem1,X,Exp,Cl,K1)
+    ;   R = R0, S = s3(L,MC,Rem,LR,Exp,Cl,K) ).
+step3(_, iremove, s3(L,MC,Rem,LR,Exp,Cl,K), S, R) :-
+    (   LR == none -> R = ise, S = s3(L,MC,Rem,LR,Exp,Cl,K)
+    ;   Exp =\= MC -> R = cme, S = s3(L,MC,Rem,LR,Exp,Cl,K)
+    ;   exclude(==(LR), L, L1), MC1 is MC + 1,
+        ( mutant(ff_no_resync) -> Exp1 = Exp ; Exp1 = MC1 ),
+        exclude(==(LR), K, K1), R = ok, S = s3(L1,MC1,Rem,none,Exp1,Cl,K1) ).
+step3(Fam, fput(Key), s3(L,MC,Rem,LR,Exp,Cl,K), s3(L1,MC1,Rem,LR,Exp,Cl1,K), ok) :-
+    between(0, 2, Key),
+    (   memberchk(Key, L)
+    ->  L1 = L, Cl1 = Cl, ( mutant(put_existing_bumps) -> MC1 is MC + 1 ; MC1 = MC )
+    ;   ins(Fam, Key, L, L1), MC1 is MC + 1, Cl1 = false ).
+step3(_, frem(Key), s3(L,MC,Rem,LR,Exp,Cl,K), s3(L1,MC1,Rem,LR,Exp,Cl1,K), ok) :-
+    between(0, 2, Key),
+    (   memberchk(Key, L)
+    ->  exclude(==(Key), L, L1), MC1 is MC + 1, Cl1 = false
+    ;   L1 = L, Cl1 = Cl, ( mutant(absent_remove_bumps) -> MC1 is MC + 1 ; MC1 = MC ) ).
+step3(_, fclear, s3(L,MC,Rem,LR,Exp,_,K), s3([],MC1,Rem,LR,Exp,false,K), ok) :-
+    ( mutant(no_clear_bump), L == [] -> MC1 = MC ; MC1 is MC + 1 ).
+
+viol3(_, next, s3(_,_,_,_,_,true,_), cme, clean_cme).
+viol3(_, iremove, s3(_,_,_,_,_,true,_), cme, clean_cme).
+viol3(hash, next, s3(_,_,_,_,_,false,_), R, dirty_miss) :- R \== cme.
+viol3(tree, next, s3(_,_,Rem,_,_,false,_), R, dirty_miss) :- ( Rem == [] -> R \== nsee ; R \== cme ).
+viol3(_, iremove, s3(_,_,_,LR,_,false,_), R, dirty_miss) :- LR \== none, R \== cme.
+viol3_after(s3(L,_,Rem,_,_,true,K), refine) :- append(K, Rem, W), W \== L.
+
+init3(Fam, s3(L,0,L,none,0,true,[])) :-
+    member(Ks, [[], [0], [0,1], [1,0,2]]), ( Fam == tree -> msort(Ks, L) ; L = Ks ).
+ops3([next, iremove, fput(0), fput(1), fput(2), frem(0), frem(1), frem(2), fclear]).
+explore3(_, _, 0, _) :- !, fail.
+explore3(Fam, S0, D, Why) :-
+    ops3(Ops), member(Op, Ops), step3(Fam, Op, S0, S, R),
+    (   viol3(Fam, Op, S0, R, W) -> Why = W-Op
+    ;   viol3_after(S, W) -> Why = W-Op
+    ;   D1 is D - 1, explore3(Fam, S, D1, Why) ).
+bad3(Fam, Why) :- fam(Fam), init3(Fam, S0), explore3(Fam, S0, 5, Why).
+
 % ================================================================ part 2
 % d(Slots, Head, Tail) and the reference list; values are distinct tokens.
 dq_cap(d(S,_,_), C) :- length(S, C).
@@ -261,10 +339,13 @@ main :-
     format("fail-fast model~n"),
     retractall(mutant(_)),
     ( bad1(K1, W1) -> format("  FAIL modCount: ~w ~w~n", [K1, W1]), halt(1) ; format("  ok   modCount protocol (ArrayList and LinkedList hasNext)~n") ),
+    ( bad3(F3, W3a) -> format("  FAIL hash/tree modCount: ~w ~w~n", [F3, W3a]), halt(1) ; format("  ok   modCount protocol (hash and tree snapshot iterators)~n") ),
     ( dq_bad(W2) -> format("  FAIL ring buffer: ~w~n", [W2]), halt(1) ; format("  ok   ring buffer refines a list, never full~n") ),
     ( dq_walk_bad(W3) -> format("  FAIL deque iterator: ~w~n", [W3]), halt(1) ; format("  ok   deque iterator walk with its own removes~n") ),
     forall(member(M-G, [no_bump-bad1(_,_), no_resync-bad1(_,_), no_step_back-bad1(_,_),
                         bound_first-bad1(_,_), hasnext_checks-bad1(_,_),
+                        put_existing_bumps-bad3(_,_), absent_remove_bumps-bad3(_,_), no_clear_bump-bad3(_,_),
+                        ff_no_resync-bad3(_,_), tree_count_first-bad3(_,_),
                         no_grow-dq_bad(_), no_slide-dq_bad(_), always_back-dq_walk_bad(_),
                         no_postdelete-dq_walk_bad(_)]),
            ( retractall(mutant(_)), assertz(mutant(M)),
