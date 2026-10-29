@@ -193,6 +193,7 @@ mkdirs!
 monitor-enter
 monitor-exit
 mono-nanos
+multi-threaded?
 munge-name
 mutex-allocations
 namespace-for

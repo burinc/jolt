@@ -988,12 +988,34 @@
 ;; specifically: File.exists answers false rather than raising, and
 ;; getAbsolutePath hands the NUL straight back. So this belongs here and not in
 ;; jfile-abs, which those two go through.
+;; It runs ahead of every File query and file open, so the walk is unchecked:
+;; the string? test leaves only the index, which stays below the length, and
+;; the checked string-ref made it ~4x slower.
+(define (jfile-nul? p)
+  (and (string? p)
+       (let ((n (string-length p)))
+         (let loop ((i 0))
+           (and (sa-ufx<? i n)
+                (or (eq? (sa-ustring-ref p i) #\nul)
+                    (loop (sa-ufx+ i 1))))))))
 (define (jfile-nul-free! p)
-  (when (let loop ((i 0))
-          (cond ((>= i (string-length p)) #f)
-                ((char=? (string-ref p i) #\nul) #t)
-                (else (loop (+ i 1)))))
+  (when (jfile-nul? p)
     (throw-jvm (quote java.io.IOException) "Invalid file path")))
+
+;; What a File whose path holds a NUL answers to the methods that ask the file
+;; system, File.isInvalid's answers: nothing exists, nothing changes. Asking the
+;; OS instead asked about the path's text BEFORE the NUL, where a C string ends,
+;; so (.delete (File. "notes.txt\0x")) deleted notes.txt. createNewFile raises
+;; (jfile-nul-free!), as the JVM's does.
+(define jfile-invalid-answers
+  (let ((t (make-hashtable string-hash string=?)))
+    (for-each (lambda (m) (hashtable-set! t m #f))
+              '("exists" "isDirectory" "isFile" "isHidden" "canRead" "canWrite"
+                "canExecute" "mkdir" "mkdirs" "delete" "renameTo" "setReadable"
+                "setWritable" "setExecutable" "setReadOnly" "setLastModified"))
+    (for-each (lambda (m) (hashtable-set! t m 0)) '("length" "lastModified"))
+    (for-each (lambda (m) (hashtable-set! t m jolt-nil)) '("list" "listFiles"))
+    t))
 
 ;; The directory half of an output path: "/a/b" -> "/a", "/a" -> "/", and #f for
 ;; a root or a bare name, which have nothing above them to create. Its callers
@@ -1965,6 +1987,10 @@
       ;; File.toURI returns a java.net.URI (JVM), not a String.
       ((string=? name "toURI")          (list (jfile->uri fp)))
       ((string=? name "toURL")          (list (make-url (jfile->url-spec fp))))
+      ;; a method that asks the file system, on a path holding a NUL
+      ;; (jfile-invalid-answers); the path-only methods above skip the lookup
+      ((and (jfile-nul? fp) (hashtable-contains? jfile-invalid-answers name))
+       (list (hashtable-ref jfile-invalid-answers name #f)))
       ((string=? name "exists")         (list (if (file-exists? fp) #t #f)))
       ((string=? name "isDirectory")    (list (if (file-directory? fp) #t #f)))
       ((string=? name "isFile")         (list (if (and (file-exists? fp) (not (file-directory? fp))) #t #f)))
@@ -1995,10 +2021,12 @@
        (list (guard (e (#t #f))
                (set-file-mtime-millis! fp (exact (floor (car args)))))))
       ((string=? name "createNewFile")
+       (jfile-nul-free! fp)
        (list (if (file-exists? fp) #f
                  (guard (e (#t #f)) (close-port (open-output-file fp 'truncate)) #t))))
       ((string=? name "renameTo")
-       (list (let ((dst (jfile-fs (car args)))) (guard (e (#t #f)) (rename-file fp dst) #t))))
+       (list (let ((dst (jfile-fs (car args))))
+               (and (not (jfile-nul? dst)) (guard (e (#t #f)) (rename-file fp dst) #t)))))
       ((string=? name "getParentFile")
        (list (let ((parent (jfile-parent-path p)))
                (if parent (make-jfile parent) jolt-nil))))
@@ -2189,6 +2217,9 @@
 ;; one: slurp-path used to stat for existence up front and now lets the open
 ;; report it.
 (define (open-path-guarded given resolved thunk)
+  ;; a C path ends at a NUL, so opening this one would open another file
+  (when (jfile-nul? resolved)
+    (throw-jvm (quote java.io.FileNotFoundException) "Invalid file path"))
   (when (file-directory? resolved) (file-open-error given resolved))
   (guard (e ((i/o-error? e) (file-open-error given resolved e)))
     (thunk resolved)))

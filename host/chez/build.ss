@@ -2299,8 +2299,8 @@
                                (sa-block-profile-tag f))))
                     (unless (equal? tag mode)
                       (error 'jolt-build
-                        (string-append "--profile-use: " f " is from a " (format "~a" tag)
-                                       " build, and this is a " mode " build; build with --profile-gen in the same mode")))))
+                        (string-append "--profile-use: " f " is from a build in " (format "~a" tag)
+                                       " mode, and this build is in " mode " mode; build with --profile-gen in the same mode")))))
                 (car use)))))))
   (when (or library? (bld-cross?)
            (and (bld-signable) (not (bld-embedded-kernel?)))

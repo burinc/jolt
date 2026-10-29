@@ -2432,6 +2432,11 @@
 ;; lacks the binding, and only a caller that actually asks for a thread id should
 ;; fail there rather than the whole runtime failing to load.
 (def-var! "jolt.host" "thread-id" (lambda () (get-thread-id)))
+;; Whether the runtime has left its single-threaded lazy path (values.ss
+;; jolt-mt?): #t once a second thread could run jolt code, never #f again. A gate
+;; reads it to pin that a program which starts no thread of its own keeps the
+;; cheap path.
+(def-var! "jolt.host" "multi-threaded?" (lambda () jolt-mt?))
 ;; The underlying runtime's identity, as strings. A telemetry resource has to name
 ;; the runtime and machine it is reporting from (process.runtime.*, host.arch);
 ;; System/getProperty answers neither here, since jolt has no JVM behind it.
