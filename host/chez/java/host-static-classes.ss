@@ -1569,23 +1569,6 @@
                           (lambda (x) (hashtable-delete! (hm-tbl self) x) (hm-drop-key! self x))
                           jutil-identity (jhost-state self) 2))
 (register-jutil-iterator! "hashset-iterator")
-;; The fail-fast iterators of the HashSet and the LinkedHashMap / LinkedHashSet
-;; families step with the state's slots read unchecked: their state is always
-;; the 7-slot vector make-jutil-ff-iterator builds (jutil-colls.ss, which is
-;; shared with targets that have no unchecked access), and next is the hot
-;; path of every walk over them.
-(define (jutil-ff-next self)
-  (let* ((st (jhost-state self)) (xs (#3%vector-ref st 0)) (v (#3%vector-ref st 4)))
-    (unless (fx=? (#3%vector-ref st 6) (vector-ref v (#3%vector-ref st 5))) (jutil-cme!))
-    (when (null? xs) (throw-jvm 'NoSuchElementException jolt-nil))
-    (let ((x (car xs)) (p (#3%vector-ref st 3)))
-      (#3%vector-set! st 0 (cdr xs))
-      (#3%vector-set! st 1 x)
-      (if p (p x) x))))
-(for-each (lambda (tag)
-            (register-host-methods! tag (list (cons "next" jutil-ff-next)))
-            (register-iterator-seq-fill! (list tag) jutil-iterator-fill jutil-ff-next))
-          '("hashset-iterator" "lhs-iterator" "lhm-keyset-iterator" "lhm-values-iterator" "lhm-entryset-iterator"))
 ;; reduce over a fail-fast collection walks its iterator (seq.ss
 ;; jolt-reduce-iter-hook); a Map is no Iterable and reduces over its seq
 (set! jolt-reduce-iter-hook
@@ -1593,10 +1576,12 @@
     (and (jutil-modcount x)
          (not (eq? (jutil-coll-kind x) 'map))
          (host-method-ref (jhost-tag x) "iterator")
-         (let* ((it (record-method-dispatch x "iterator" jolt-nil))
-                (has? (iterator-seq-method it "hasNext"))
-                (next (iterator-seq-method it "next")))
-           (lambda () (if (jolt-truthy? (has? it)) (next it) reduce-iter-done))))))
+         (let ((it (record-method-dispatch x "iterator" jolt-nil)))
+           (if (al-family? x)
+               ;; ArrayList$Itr / LinkedList$ListItr, stepped directly
+               (lambda () (if (ali-has-next? it) (ali-next it) reduce-iter-done))
+               (let ((has? (iterator-seq-method it "hasNext")) (next (iterator-seq-method it "next")))
+                 (lambda () (if (jolt-truthy? (has? it)) (next it) reduce-iter-done))))))))
 (register-modcount! "hashset" hm-mc)
 (register-modcount! "hashmap" hm-mc)
 (register-modcount! "jx-weak-hashmap" hm-mc)

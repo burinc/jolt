@@ -128,7 +128,6 @@
 (define (tmr-cmp-obj r) (vector-ref r 1))
 (define (tmr-cmpf r) (vector-ref r 2))
 (define (tmr-natural? r) (jolt-nil? (vector-ref r 1)))
-(define (tmr-mc r) (vector-ref r 3))
 (define (tmr-bump! r) (vector-set! r 3 (fxand (fx+ (vector-ref r 3) 1) #x3fffffff)))
 ;; the modCount a walk over the root expects, or #f for one that is not
 ;; fail-fast (a ConcurrentSkipListMap's, whose iterators are weakly consistent)
@@ -621,10 +620,12 @@
   (let ((r (v-root v))) (make-jhost tag (vector v entries #f project (tmr-expect r) r))))
 (define (tmi-ref it i) (vector-ref (jhost-state it) i))
 (define (tmi-set! it i x) (vector-set! (jhost-state it) i x))
-;; inline: next pays it per element
+;; inline: next pays it per element. Unchecked reads (sa-uvector-ref): ST is
+;; the 6-slot vector make-tm-iterator builds and slot 5 a root, which has at
+;; least four slots (tm-make-root, cs-new-root).
 (define-syntax tmi-current-st?
   (syntax-rules ()
-    ((_ st) (let ((e (vector-ref st 4))) (or (not e) (fx=? e (vector-ref (vector-ref st 5) 3)))))))
+    ((_ st) (let ((e (sa-uvector-ref st 4))) (or (not e) (fx=? e (sa-uvector-ref (sa-uvector-ref st 5) 3)))))))
 (define (tmi-current? it) (tmi-current-st? (jhost-state it)))
 (define (tmi-next self)
   (let* ((st (jhost-state self)) (es (vector-ref st 1)))

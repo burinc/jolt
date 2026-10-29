@@ -272,20 +272,23 @@
 (define (jutil-project-slot p) (if (eq? p jutil-identity) #f p))
 (define-syntax jutil-project
   (syntax-rules ()
-    ((_ st x) (let ((p (vector-ref st 3))) (if p (p x) x)))))
+    ((_ st x) (let ((p (sa-uvector-ref st 3))) (if p (p x) x)))))
 ;; is the count still the one expected (always, for one that watches none);
-;; inline, as next pays it per element
+;; inline, as next pays it per element. Unchecked reads (sa-uvector-ref): ST is
+;; the 7-slot vector the two constructors above build, and slot MCI of MCV is
+;; the count's slot in a state its collection's constructor sized for it (2 of
+;; a HashMap / HashSet state, 5 of a LinkedHashMap chain).
 (define-syntax jutil-iterator-current?
   (syntax-rules ()
-    ((_ st) (let ((v (vector-ref st 4)))
-              (or (not v) (fx=? (vector-ref st 6) (vector-ref v (vector-ref st 5))))))))
+    ((_ st) (let ((v (sa-uvector-ref st 4)))
+              (or (not v) (fx=? (sa-uvector-ref st 6) (sa-uvector-ref v (sa-uvector-ref st 5))))))))
 (define (jutil-iterator-next self)
-  (let* ((st (jhost-state self)) (xs (vector-ref st 0)))
+  (let* ((st (jhost-state self)) (xs (sa-uvector-ref st 0)))
     (unless (jutil-iterator-current? st) (jutil-cme!))
     (when (null? xs) (throw-jvm 'NoSuchElementException jolt-nil))
     (let ((x (car xs)))
-      (vector-set! st 0 (cdr xs))
-      (vector-set! st 1 x)
+      (sa-uvector-set! st 0 (cdr xs))
+      (sa-uvector-set! st 1 x)
       (jutil-project st x))))
 (define jutil-iterator-methods
   (list (cons "hasNext" (lambda (self) (pair? (vector-ref (jhost-state self) 0))))
@@ -337,16 +340,19 @@
 ;; has moved since the seq was made, as the iterator's next would raise.
 (define (jutil-ff-seq coll xs)
   (let* ((mc (jutil-modcount-reader coll)) (e (and mc (mc coll))))
+    ;; 32 cells; the 32nd's tail, when more follow, is read when the walk asks
+    ;; for it. Plain cells: (seq coll) is no chunked seq on the JVM (it is the
+    ;; LazySeq over RT.chunkIteratorSeq).
     (define (chunk xs)
-      (let loop ((xs xs) (i 0))
-        (cond ((null? xs) jolt-nil)
-              ((fx=? i 32) (later xs))
-              (else (cseq-realized (car xs) (loop (cdr xs) (fx+ i 1)))))))
-    (define (later xs)
-      (jolt-make-lazy-seq
-        (lambda ()
-          (when (and mc (not (eqv? e (mc coll)))) (jutil-cme!))
-          (chunk xs))))
+      (let loop ((xs xs) (i 1))
+        (let ((rest (cdr xs)))
+          (cond ((null? rest) (cseq-realized (car xs) jolt-nil))
+                ((fx=? i 32)
+                 (cseq-lazy (car xs)
+                            (lambda ()
+                              (when (and mc (not (eqv? e (mc coll)))) (jutil-cme!))
+                              (chunk rest))))
+                (else (cseq-realized (car xs) (loop rest (fx+ i 1))))))))
     (if (null? xs) jolt-nil (chunk xs))))
 
 ;; ---- the default Collection walks over a fail-fast iterator ----------------------
