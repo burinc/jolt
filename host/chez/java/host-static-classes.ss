@@ -949,8 +949,43 @@
 (define (hm-list->idx self ks)          ; ks newest first, all live
   (let ((ix (hm-like-table self)))
     (make-hm-idx (map (lambda (k) (let ((c (cons k #t))) (hashtable-set! ix k c) c)) ks) ix 0)))
-;; slot 3 is a ConcurrentHashMap's reservations (chm-reserving); '() elsewhere
+;; slot 3 is a ConcurrentHashMap's claims (chm-claim!); '() elsewhere
 (define (hm-state tbl ord) (vector tbl ord 0 '()))
+;; A ConcurrentHashMap's state adds slot 4, its private monitor, which every
+;; write and every walk of the key order holds, and slot 5, how many threads
+;; wait in chm-await-key! for another's claim on a key to end.
+(define (chm-state tbl) (vector tbl '() 0 '() (make-monitor) 0))
+(define (hm-chm? self) (string=? (jhost-tag self) "chm"))
+;; Before a second thread exists (jolt-mt?, values.ss) there is no writer to
+;; exclude, so the body runs as it is: the monitor is most of a single-threaded
+;; put's cost. Unless another owner holds a claim (chm-claim!): fibers drained on
+;; this one thread can, and waiting that claim out needs the monitor.
+(define-syntax with-chm
+  (syntax-rules ()
+    ((_ self e ...)
+     (let ((st (jhost-state self)))
+       (if (and (not jolt-mt?) (chm-claims-mine? st))
+           (begin e ...)
+           (jolt-call-with-monitor (vector-ref st 4) (lambda () e ...)))))))
+;; A Properties is synchronized on itself, as the JDK's writes are: slot 5 holds
+;; its own monitor, so (locking props ...) excludes its methods. The same
+;; single-threaded shortcut as with-chm, unless this thread holds the monitor
+;; already (a locking block around the call) and so must enter it again.
+(define (props-state tbl ord defaults writethrough)
+  (vector tbl ord 0 defaults writethrough #f))
+(define (props-own-monitor! self) (vector-set! (jhost-state self) 5 (object-monitor self)) self)
+(define (hm-props? self) (string=? (jhost-tag self) "properties"))
+(define-syntax with-props
+  (syntax-rules ()
+    ((_ self e ...)
+     (let ((m (vector-ref (jhost-state self) 5)))
+       (if (and (not jolt-mt?) (not (vector-ref m monitor-i-owner)))
+           (begin e ...)
+           (jolt-call-with-monitor m (lambda () e ...)))))))
+(define (chm-claims-mine? st)
+  (let ((cs (vector-ref st 3)))
+    (or (null? cs)
+        (let ((me (chm-owner))) (for-all (lambda (c) (eqv? (chm-claim-owner c) me)) cs)))))
 (define (hm-mc self) (vector-ref (jhost-state self) 2))
 (define-syntax hm-bump!
   ;; inline: every new key and every removal pays it
@@ -1020,7 +1055,19 @@
   (hm-bump! self)
   (hashtable-clear! (hm-tbl self))
   (hm-ord! self (if (hm-weak? self) (list 'v) '())))
+;; A ConcurrentHashMap's and a Properties' walks take the order and the values
+;; under the map's lock, so a walk racing a write sees each key with the value it
+;; had, never a key whose value a remove already took.
 (define (hm-keys-ordered self)
+  (cond ((hm-chm? self) (with-chm self (hm-keys-ordered* self)))
+        ((hm-props? self) (with-props self (hm-keys-ordered* self)))
+        (else (hm-keys-ordered* self))))
+(define (hm-pairs-ordered self)          ; ((k . v) ...) in the map's order
+  (define (pairs) (let ((t (hm-tbl self))) (map (lambda (k) (cons k (hashtable-ref t k jolt-nil))) (hm-keys-ordered* self))))
+  (cond ((hm-chm? self) (with-chm self (pairs)))
+        ((hm-props? self) (with-props self (pairs)))
+        (else (pairs))))
+(define (hm-keys-ordered* self)
   (if (hm-weak? self)
       ;; by hash: the same keys come out in the same order whatever the
       ;; history of the table (an image restore included). Not the JDK's bucket
@@ -1048,10 +1095,10 @@
                 (else #f))))))
 (define (hm-copy-into-ordered! self src)  ; copy a jolt map or hashmap, keeping insertion order
   (if (hm-hashmap? src)
-      (for-each (lambda (k)
-                  (hm-note-key! self k)
-                  (hashtable-set! (hm-tbl self) k (hashtable-ref (hm-tbl src) k jolt-nil)))
-                (hm-keys-ordered src))
+      (for-each (lambda (kv)
+                  (hm-note-key! self (car kv))
+                  (hashtable-set! (hm-tbl self) (car kv) (cdr kv)))
+                (hm-pairs-ordered src))
       (for-each (lambda (e)
                   (hm-note-key! self (jolt-nth e 0))
                   (hashtable-set! (hm-tbl self) (jolt-nth e 0) (jolt-nth e 1)))
@@ -1078,14 +1125,16 @@
 ;; unlinked node.
 (define (hm-walk self f)
   (let ((kind (hm-ff-kind self)) (t (hm-tbl self)) (mc (hm-mc self)))
-    (for-each (lambda (k)
-                (case kind
-                  ((end) (when (or (fx=? mc (hm-mc self)) (hashtable-contains? t k))
-                           (f k (hashtable-ref t k jolt-nil))))
-                  ((step) (f k (hashtable-ref t k jolt-nil))
-                          (unless (fx=? mc (hm-mc self)) (jutil-cme!)))
-                  (else (f k (hashtable-ref t k jolt-nil)))))
-              (hm-keys-ordered self))
+    (if kind
+        (for-each (lambda (k)
+                    (case kind
+                      ((end) (when (or (fx=? mc (hm-mc self)) (hashtable-contains? t k))
+                               (f k (hashtable-ref t k jolt-nil))))
+                      (else (f k (hashtable-ref t k jolt-nil))
+                            (unless (fx=? mc (hm-mc self)) (jutil-cme!)))))
+                  (hm-keys-ordered self))
+        ;; weakly consistent: the entries as they stood when the walk began
+        (for-each (lambda (kv) (f (car kv) (cdr kv))) (hm-pairs-ordered self)))
     (when (and (eq? kind 'end) (not (fx=? mc (hm-mc self)))) (jutil-cme!))
     jolt-nil))
 ;; a HashMap's compute family: a function that changed the map's structure is
@@ -1216,10 +1265,10 @@
 ;; as a key lookup and so read nil for every system property — how a library that
 ;; reads them through the Properties API saw nothing.
 (define (make-properties-jhost . defaults)
-  (make-jhost "properties"
-              (vector (make-hashtable hm-hash jolt=2) (quote ()) 0
-                      (if (pair? defaults) (car defaults) #f)
-                      #f)))
+  (props-own-monitor!
+    (make-jhost "properties"
+                (props-state (make-hashtable hm-hash jolt=2) (quote ())
+                             (if (pair? defaults) (car defaults) #f) #f))))
 (define (props-slot self i)
   (let ((st (jhost-state self)))
     (and (fx>? (vector-length st) i) (vector-ref st i))))
@@ -1255,8 +1304,10 @@
   (hm-note-key! self k)
   (hashtable-set! (hm-tbl self) k v)
   (let ((wt (props-writethrough self)))
-    (when wt (hashtable-set! wt k (if (string? v) v (jolt-str-render-one v))))))
-(register-host-methods! "properties"
+    (when wt (jolt-with-mutex sys-prop-mu (hashtable-set! wt k (if (string? v) v (jolt-str-render-one v)))))))
+;; the System properties' writethrough table (host-static-methods.ss) is shared
+;; with System/setProperty, so its writes take that table's mutex
+(define props-methods
   (append
     hashmap-methods
     (list
@@ -1271,26 +1322,55 @@
       (cons "put" (lambda (self k v)
                     (let ((old (hashtable-ref (hm-tbl self) k jolt-nil)))
                       (props-put! self k v) old)))
-      (cons "remove" (lambda (self k)
-                       (let ((old (hashtable-ref (hm-tbl self) k jolt-nil)))
-                         ;; an absent key changes nothing, the key order included
-                         (when (hashtable-contains? (hm-tbl self) k)
-                           (hashtable-delete! (hm-tbl self) k)
-                           (hm-drop-key! self k))
-                         (let ((wt (props-writethrough self)))
-                           (when wt (hashtable-delete! wt k)))
-                         old)))
+      (cons "remove" (letrec ((rm (case-lambda
+                                    ((self k)
+                                     (let ((old (hashtable-ref (hm-tbl self) k jolt-nil)))
+                                       ;; an absent key changes nothing, the key order included
+                                       (when (hashtable-contains? (hm-tbl self) k)
+                                         (hashtable-delete! (hm-tbl self) k)
+                                         (hm-drop-key! self k))
+                                       (let ((wt (props-writethrough self)))
+                                         (when wt (jolt-with-mutex sys-prop-mu (hashtable-delete! wt k))))
+                                       old))
+                                    ;; remove(key, value): only when mapped to exactly that
+                                    ((self k v)
+                                     (and (hashtable-contains? (hm-tbl self) k)
+                                          (jolt=2 v (hashtable-ref (hm-tbl self) k jolt-nil))
+                                          (begin (rm self k) #t))))))
+                       rm))
       (cons "clear" (lambda (self)
                       (hm-clear! self)
                       (let ((wt (props-writethrough self)))
-                        (when wt (hashtable-clear! wt)))
+                        (when wt (jolt-with-mutex sys-prop-mu (hashtable-clear! wt))))
                       jolt-nil))
       ;; the two enumerations that DO span the defaults chain.
       (cons "stringPropertyNames"
             (lambda (self) (apply jolt-hash-set
                              (filter (lambda (k) (string? (props-string-ref self k #f)))
                                      (props-names self)))))
-      (cons "propertyNames" (lambda (self) (list->cseq (props-names self)))))))
+      (cons "propertyNames" (lambda (self) (list->cseq (props-names self))))
+      (cons "clone" (lambda (self)
+                      (let ((c (if (props-defaults self) (make-properties-jhost (props-defaults self)) (make-properties-jhost))))
+                        (hm-copy-into-ordered! c self)
+                        c))))))
+;; The JDK's Properties synchronizes every write and forEach on the object (a
+;; compute function runs under it there too); reads go to its table unlocked.
+(define props-synchronized
+  '("put" "putIfAbsent" "setProperty" "remove" "clear" "putAll" "replace" "replaceAll"
+    "merge" "compute" "computeIfAbsent" "computeIfPresent" "forEach"))
+(define (props-locked proc)
+  (make-arity-wrapper-procedure
+    (case-lambda
+      ((self) (with-props self (proc self)))
+      ((self a) (with-props self (proc self a)))
+      ((self a b) (with-props self (proc self a b)))
+      ((self a b c) (with-props self (proc self a b c)))
+      ((self . r) (with-props self (apply proc self r))))
+    (procedure-arity-mask proc)
+    #f))
+(register-host-methods! "properties"
+  (map (lambda (m) (if (member (car m) props-synchronized) (cons (car m) (props-locked (cdr m))) m))
+       props-methods))
 (register-class-ctor! "Properties"
   (lambda args (apply make-properties-jhost args)))
 (register-class-ctor! "java.util.Properties"
@@ -1299,96 +1379,202 @@
 ;; recomputed per call so user.dir and java.class.path stay current, with writes
 ;; going through to the override store.
 (define (make-system-properties m override-tbl)
-  (let ((self (make-jhost "properties"
-                          (vector (make-hashtable hm-hash jolt=2) (quote ()) 0 #f override-tbl))))
+  (let ((self (props-own-monitor!
+                (make-jhost "properties" (props-state (make-hashtable hm-hash jolt=2) (quote ()) #f override-tbl)))))
     (for-each (lambda (e)
                 (hm-note-key! self (jolt-nth e 0))
                 (hashtable-set! (hm-tbl self) (jolt-nth e 0) (jolt-nth e 1)))
               (seq->list (jolt-seq m)))
     self))
 
-;; java.util.concurrent.ConcurrentHashMap — the HashMap shim's storage and
-;; methods under a tag of its own, so it is its own class: a ConcurrentMap,
-;; refusing null keys and values, whose views are weakly consistent
-;; (jutil-concurrent.ss). (get a-chm k) reads the map (clojure.core/get).
+;; java.util.concurrent.ConcurrentHashMap — the HashMap shim's storage under a
+;; tag of its own, so it is its own class: a ConcurrentMap, refusing null keys
+;; and values, whose views are weakly consistent (jutil-concurrent.ss).
+;; (get a-chm k) reads the map (clojure.core/get).
+;;
+;; Every write, and every walk of the key order, holds the map's private monitor
+;; (chm-state): two writers corrupt a Chez hashtable, and the key order is a
+;; second structure each write keeps in step with the table. A read of one key
+;; (get, containsKey, size) takes no lock; against a locked writer it can only
+;; see the value the write is replacing.
+;;
+;; The compute family runs its function OUTSIDE the monitor, as the JDK runs it
+;; holding only the key's own bin: the key is CLAIMED instead (slot 3), and
+;; another thread's write to that key waits until the claim ends
+;; (chm-await-key!) while writes to other keys go through. Holding the monitor
+;; across the function would deadlock a function that waits on another thread
+;; writing any key of the map, which the JDK does not.
+;; While computeIfAbsent, or compute over an absent key, runs its function, the
+;; JDK holds a ReservationNode in the key's bin, and a write that reaches that
+;; bin from inside the function is IllegalStateException "Recursive update"
+;; (jolt-2gc66): such a claim is RESERVED. Over a present key the JDK holds the
+;; bin's lock, which its own thread re-enters, so the function's own writes to
+;; the key go through. Which OTHER keys share the bin is the JDK's table layout,
+;; so only the claimed key itself is refused here (known-divergences).
 (define (make-chm-jhost . args)
-  (let* ((ht (make-hashtable hm-hash jolt=2))
-         (self (make-jhost "chm" (hm-state ht '()))))
+  (let ((self (make-jhost "chm" (chm-state (make-hashtable hm-hash jolt=2)))))
     (when (and (pair? args) (not (number? (car args))))
-      (hm-copy-into-ordered! self (car args)))
+      (chm-put-all! self (car args)))
     self))
 (register-class-ctor! "ConcurrentHashMap" make-chm-jhost)
 (register-class-ctor! "java.util.concurrent.ConcurrentHashMap" make-chm-jhost)
 (define (chm-npe!) (throw-jvm 'NullPointerException jolt-nil))
 (define (chm-method name) (cdr (assoc name hashmap-methods)))
-;; While computeIfAbsent, or compute over an absent key, runs its function, the
-;; JDK holds a ReservationNode in the key's bin, and a write that reaches that
-;; bin from inside the function is IllegalStateException "Recursive update"
-;; (jolt-2gc66); reads and other bins go through. Slot 3 lists the keys being
-;; computed, each with the thread or fiber computing it: another thread's write
-;; waits for the bin on the JDK and is never refused. Which OTHER keys share the
-;; bin is the JDK's table layout, so only the reserved key itself is refused here
-;; (known-divergences).
 (define (chm-owner)
   (let ((r (virtual-register jolt-vreg-current-fiber))) (if (eq? r 0) (get-thread-id) r)))
-(define (chm-reserved self) (vector-ref (jhost-state self) 3))
-(define (chm-check-key! self k)
-  (let ((rs (chm-reserved self)))
-    (unless (null? rs)
-      (let ((me (chm-owner)))
-        (when (exists (lambda (r) (and (eqv? (car r) me) (jolt=2 (cdr r) k))) rs)
-          (throw-jvm 'IllegalStateException "Recursive update"))))))
-(define (chm-reserving self k thunk)
-  (let ((r (cons (chm-owner) k)) (st (jhost-state self)))
-    (dynamic-wind
-      (lambda () (vector-set! st 3 (cons r (vector-ref st 3))))
-      thunk
-      (lambda () (vector-set! st 3 (remq r (vector-ref st 3)))))))
+(define (chm-monitor self) (vector-ref (jhost-state self) 4))
+(define-record-type chm-claim (fields owner key reserved?))
+;; Under the monitor: wait out another owner's claim on k (the wait lets the
+;; monitor go). Every claim on one key is one owner's, since a second owner
+;; waits here; a reserved one of this owner's own is the Recursive update.
+(define (chm-await-key! self k)
+  (let ((st (jhost-state self)))
+    (let loop ()
+      (unless (null? (vector-ref st 3))
+        (let ((on-k (filter (lambda (c) (jolt=2 (chm-claim-key c) k)) (vector-ref st 3))))
+          (cond ((null? on-k))
+                ((not (eqv? (chm-claim-owner (car on-k)) (chm-owner)))
+                 (vector-set! st 5 (fx+ (vector-ref st 5) 1))
+                 (guard (e (#t (vector-set! st 5 (fx- (vector-ref st 5) 1)) (raise e)))
+                   (monitor-object-wait! (chm-monitor self) #f))
+                 (vector-set! st 5 (fx- (vector-ref st 5) 1))
+                 (loop))
+                ((exists chm-claim-reserved? on-k)
+                 (throw-jvm 'IllegalStateException "Recursive update"))))))))
+(define (chm-claim! self k reserved?)   ; under the monitor, after chm-await-key!
+  (let ((c (make-chm-claim (chm-owner) k reserved?)) (st (jhost-state self)))
+    (vector-set! st 3 (cons c (vector-ref st 3)))
+    c))
+(define (chm-release! self c)           ; under the monitor
+  (let ((st (jhost-state self)))
+    (vector-set! st 3 (remq c (vector-ref st 3)))
+    (unless (eqv? 0 (vector-ref st 5)) (monitor-notify! (chm-monitor self) #t))))
+;; under the monitor: k mapped to v, or to nothing when v is nil
+(define (chm-store! self k v)
+  (let ((t (hm-tbl self)))
+    (cond ((not (jolt-nil? v)) (hm-note-key! self k) (hashtable-set! t k v))
+          ((hashtable-contains? t k) (hashtable-delete! t k) (hm-drop-key! self k)))
+    v))
+(define chm-reserve (list 'reserve))
+(define chm-lock (list 'lock))
+;; One compute-family call. Under the monitor, once no other owner claims k,
+;; (start old) answers the call's result, or chm-reserve / chm-lock to claim k;
+;; then (call old) runs with the monitor let go and its value is stored. A call
+;; that throws leaves the map as it was; the claim ends either way, except that
+;; a fiber parking inside the function keeps it.
+(define (chm-compute! self k start call)
+  (let* ((old jolt-nil)
+         (s (with-chm self
+              (chm-await-key! self k)
+              (set! old (hashtable-ref (hm-tbl self) k jolt-nil))
+              (let ((d (start old)))
+                (cond ((eq? d chm-reserve) (chm-claim! self k #t))
+                      ((eq? d chm-lock) (chm-claim! self k #f))
+                      (else d))))))
+    (if (chm-claim? s)
+        (let ((done #f))
+          (dynamic-wind
+            (lambda () #f)
+            (lambda ()
+              (let ((v (call old)))
+                (set! done #t)
+                (with-chm self (chm-release! self s) (chm-store! self k v))))
+            (lambda ()
+              (unless (or done (jolt-park-unwinding?))
+                (set! done #t)
+                (with-chm self (chm-release! self s))))))
+        s)))
+(define (chm-put-all! self m)
+  (for-each (lambda (e)
+              (let ((k (jolt-nth e 0)) (v (jolt-nth e 1)))
+                (when (or (jolt-nil? k) (jolt-nil? v)) (chm-npe!))
+                (with-chm self (chm-await-key! self k) (chm-store! self k v))))
+            (if (hm-hashmap? m)
+                (map (lambda (kv) (make-map-entry (car kv) (cdr kv))) (hm-pairs-ordered m))
+                (seq->list (jolt-seq m)))))
 ;; hashmap's methods, refusing a null key or value as ConcurrentHashMap does;
 ;; fixed arities, so a call allocates nothing for the check
 (register-host-methods! "chm"
   (append hashmap-methods
-          (let ((put (chm-method "put")) (pia (chm-method "putIfAbsent")) (cv (chm-method "containsValue"))
-                (rm (chm-method "remove")) (rep (chm-method "replace")) (mrg (chm-method "merge"))
-                (cip (chm-method "computeIfPresent")) (cia (chm-method "computeIfAbsent"))
-                (cmp (chm-method "compute")) (pall (chm-method "putAll")))
-            (list (cons "put" (lambda (self k v) (when (or (jolt-nil? k) (jolt-nil? v)) (chm-npe!)) (chm-check-key! self k) (put self k v)))
-                  (cons "putIfAbsent" (lambda (self k v) (when (or (jolt-nil? k) (jolt-nil? v)) (chm-npe!)) (chm-check-key! self k) (pia self k v)))
+          (let ((put (chm-method "put")) (pia (chm-method "putIfAbsent"))
+                (rm (chm-method "remove")) (rep (chm-method "replace")))
+            (list (cons "put" (lambda (self k v)
+                                (when (or (jolt-nil? k) (jolt-nil? v)) (chm-npe!))
+                                (with-chm self (chm-await-key! self k) (put self k v))))
+                  (cons "putIfAbsent" (lambda (self k v)
+                                        (when (or (jolt-nil? k) (jolt-nil? v)) (chm-npe!))
+                                        (with-chm self (chm-await-key! self k) (pia self k v))))
                   (cons "get" (lambda (self k) (when (jolt-nil? k) (chm-npe!)) (hashtable-ref (hm-tbl self) k jolt-nil)))
+                  (cons "getOrDefault" (lambda (self k d) (when (jolt-nil? k) (chm-npe!)) (hashtable-ref (hm-tbl self) k d)))
                   (cons "containsKey" (lambda (self k) (when (jolt-nil? k) (chm-npe!)) (if (hashtable-contains? (hm-tbl self) k) #t #f)))
-                  (cons "containsValue" (lambda (self v) (when (jolt-nil? v) (chm-npe!)) (cv self v)))
+                  (cons "containsValue" (lambda (self v)
+                                          (when (jolt-nil? v) (chm-npe!))
+                                          (if (exists (lambda (kv) (jolt=2 v (cdr kv))) (hm-pairs-ordered self)) #t #f)))
+                  (cons "mappingCount" (lambda (self) (hashtable-size (hm-tbl self))))
                   (cons "remove" (case-lambda
-                                   ((self k) (when (jolt-nil? k) (chm-npe!)) (chm-check-key! self k) (rm self k))
-                                   ((self k v) (when (jolt-nil? k) (chm-npe!)) (chm-check-key! self k) (rm self k v))))
+                                   ((self k) (when (jolt-nil? k) (chm-npe!))
+                                    (with-chm self (chm-await-key! self k) (rm self k)))
+                                   ;; remove(key, null) removes nothing, as the JDK's
+                                   ((self k v) (when (jolt-nil? k) (chm-npe!))
+                                    (and (not (jolt-nil? v))
+                                         (with-chm self (chm-await-key! self k) (rm self k v))))))
                   (cons "replace" (case-lambda
-                                    ((self k v) (chm-check-key! self k) (rep self k v))
-                                    ((self k old v) (chm-check-key! self k)
-                                     (if (and (hashtable-contains? (hm-tbl self) k)
-                                              (jolt=2 old (hashtable-ref (hm-tbl self) k jolt-nil)))
-                                         (begin (hashtable-set! (hm-tbl self) k v) #t)
-                                         #f))))
-                  (cons "merge" (lambda (self k v f) (chm-check-key! self k) (mrg self k v f)))
-                  (cons "computeIfPresent" (lambda (self k f) (chm-check-key! self k) (cip self k f)))
-                  ;; a present key answers its value from the one lookup: the
-                  ;; map holds no nil, so nil is absent
+                                    ((self k v) (when (or (jolt-nil? k) (jolt-nil? v)) (chm-npe!))
+                                     (with-chm self (chm-await-key! self k) (rep self k v)))
+                                    ((self k old v) (when (or (jolt-nil? k) (jolt-nil? old) (jolt-nil? v)) (chm-npe!))
+                                     (with-chm self
+                                       (chm-await-key! self k)
+                                       (if (and (hashtable-contains? (hm-tbl self) k)
+                                                (jolt=2 old (hashtable-ref (hm-tbl self) k jolt-nil)))
+                                           (begin (hashtable-set! (hm-tbl self) k v) #t)
+                                           #f)))))
+                  (cons "merge" (lambda (self k v f)
+                                  (when (or (jolt-nil? k) (jolt-nil? v) (jolt-nil? f)) (chm-npe!))
+                                  (chm-compute! self k
+                                    (lambda (old) (if (jolt-nil? old) (chm-store! self k v) chm-lock))
+                                    (lambda (old) (jolt-fi-call f "apply" old v)))))
+                  (cons "computeIfPresent" (lambda (self k f)
+                                             (when (or (jolt-nil? k) (jolt-nil? f)) (chm-npe!))
+                                             (chm-compute! self k
+                                               (lambda (old) (if (jolt-nil? old) jolt-nil chm-lock))
+                                               (lambda (old) (jolt-fi-call f "apply" k old)))))
+                  ;; a present key answers its value from one lock-free lookup, as
+                  ;; the JDK's does from the bin's first node: the map holds no
+                  ;; nil, so nil is absent
                   (cons "computeIfAbsent"
                         (lambda (self k f)
-                          (chm-check-key! self k)
+                          (when (or (jolt-nil? k) (jolt-nil? f)) (chm-npe!))
                           (let ((old (hashtable-ref (hm-tbl self) k jolt-nil)))
                             (if (jolt-nil? old)
-                                (chm-reserving self k (lambda () (cia self k f)))
+                                (chm-compute! self k
+                                  (lambda (old) (if (jolt-nil? old) chm-reserve old))
+                                  (lambda (old) (jolt-fi-call f "apply" k)))
                                 old))))
-                  (cons "compute"
-                        (lambda (self k f)
-                          (chm-check-key! self k)
-                          (if (hashtable-contains? (hm-tbl self) k)
-                              (cmp self k f)
-                              (chm-reserving self k (lambda () (cmp self k f))))))
-                  (cons "putAll" (lambda (self m)
-                                   (unless (null? (chm-reserved self))
-                                     (for-each (lambda (e) (chm-check-key! self (jolt-nth e 0)))
-                                               (seq->list (jolt-seq m))))
-                                   (pall self m)))))))
+                  (cons "compute" (lambda (self k f)
+                                    (when (or (jolt-nil? k) (jolt-nil? f)) (chm-npe!))
+                                    (chm-compute! self k
+                                      (lambda (old) (if (jolt-nil? old) chm-reserve chm-lock))
+                                      (lambda (old) (jolt-fi-call f "apply" k old)))))
+                  (cons "putAll" (lambda (self m) (chm-put-all! self m) jolt-nil))
+                  (cons "clear" (lambda (self) (with-chm self (hm-clear! self)) jolt-nil))
+                  ;; each value becomes f(key, value) unless a write changed it
+                  ;; meanwhile, when f sees the new one, as the JDK's replaceNode
+                  ;; loop does; f runs with the monitor let go
+                  (cons "replaceAll" (lambda (self f)
+                                       (for-each (lambda (kv)
+                                                   (let loop ((v (cdr kv)))
+                                                     (let ((nv (jolt-fi-call f "apply" (car kv) v)))
+                                                       (when (jolt-nil? nv) (chm-npe!))
+                                                       (let ((cur (with-chm self
+                                                                    (chm-await-key! self (car kv))
+                                                                    (let ((cur (hashtable-ref (hm-tbl self) (car kv) jolt-nil)))
+                                                                      (if (or (eq? cur v) (jolt=2 cur v))
+                                                                          (begin (hashtable-set! (hm-tbl self) (car kv) nv) jolt-nil)
+                                                                          cur)))))
+                                                         (unless (jolt-nil? cur) (loop cur))))))
+                                                 (hm-pairs-ordered self))
+                                       jolt-nil))
+                  (cons "clone" (lambda (self) (make-chm-jhost self)))))))
 ;; WeakHashMap: the HashMap shim over a weak table (Chez's generic weak
 ;; hashtables hold their keys weakly under jolt's own hash and equality), so an
 ;; entry whose key nothing else holds goes at the next collection, as on the JDK.
@@ -1697,8 +1883,7 @@
 ;; prints as #object over its toString.
 ;; the entries =, hash and print walk, which see only keys and values
 (define (hm-entries self)
-  (map (lambda (k) (make-map-entry k (hashtable-ref (hm-tbl self) k jolt-nil)))
-       (hm-keys-ordered self)))
+  (map (lambda (kv) (make-map-entry (car kv) (cdr kv))) (hm-pairs-ordered self)))
 ;; A Map seqs through its entrySet's iterator on the JVM (RT.seq), so a seq
 ;; yields the map's own live entries (HashMap$Node, ConcurrentHashMap$MapEntry
 ;; ...), as a LinkedHashMap's already does, not detached MapEntry pairs
