@@ -206,11 +206,16 @@
   (let ((es (dq-es self))) (dq-each-index es (dq-head self) (dq-tail self) (lambda (i) (vector-set! es i jolt-nil))))
   (dq-head! self 0) (dq-tail! self 0)
   jolt-nil)
+;; The JDK adds through c.forEach. A deque added to itself walks to the tail it
+;; started with, adding each element at the end, and then finds its tail moved:
+;; every element is in twice and the call is a ConcurrentModificationException.
 (define (dq-add-all! self c)
+  (when (jolt-nil? c) (throw-jvm 'NullPointerException jolt-nil))
   (let* ((xs (seq->list (jolt-seq c))) (s (dq-size self))
          (needed (fx- (fx+ s (length xs) 1) (vector-length (dq-es self)))))
     (when (fx>? needed 0) (dq-grow! self needed))
     (for-each (lambda (x) (dq-add-last! self x)) xs)
+    (when (and (eq? c self) (pair? xs)) (throw-jvm 'ConcurrentModificationException jolt-nil))
     (fx>? (dq-size self) s)))
 
 ;; The list layout took a nil ((.add d nil) was accepted before the ring), but

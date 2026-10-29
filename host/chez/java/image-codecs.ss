@@ -22,7 +22,7 @@
 (register-image-codec! "java.util.HashMap" '("hashmap" "properties" "chm" "jx-weak-hashmap" "jx-identity-hashmap")
   (lambda (m)
     (vector (vector (jhost-tag m) (or (and (string=? (jhost-tag m) "properties") (props-defaults m)) jolt-nil))
-            (codec-kvs (map (lambda (k) (cons k (hashtable-ref (hm-tbl m) k jolt-nil))) (hm-keys-ordered m)))))
+            (codec-kvs (hm-pairs-ordered m))))
   (lambda (h)
     (if (string=? (vector-ref h 0) "properties")
         (make-jhost "properties" (vector (make-hashtable hm-hash jolt=2) '() 0
@@ -31,6 +31,7 @@
         (let ((tag (vector-ref h 0)))
           (cond ((string=? tag "jx-weak-hashmap") (make-jhost tag (hm-state (make-weak-hashtable hm-hash jolt=2) (list 'v))))
                 ((string=? tag "jx-identity-hashmap") (make-jhost tag (hm-state (make-eq-hashtable) '())))
+                ((string=? tag "chm") (make-chm-jhost))
                 (else (make-jhost tag (hm-state (make-hashtable hm-hash jolt=2) '())))))))
   (lambda (m items)
     (codec-each-kv! items (lambda (k v) (hm-note-key! m k) (hashtable-set! (hm-tbl m) k v)))))

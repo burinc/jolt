@@ -1831,8 +1831,7 @@
   ;; projection chosen once
   (case kind
     ((key) (lambda (v) (hm-keys-ordered (hmv-map v))))
-    ((value) (lambda (v) (let ((t (hm-tbl (hmv-map v))))
-                           (map (lambda (k) (hashtable-ref t k jolt-nil)) (hm-keys-ordered (hmv-map v))))))
+    ((value) (lambda (v) (map cdr (hm-pairs-ordered (hmv-map v)))))
     (else (lambda (v) (let* ((m (hmv-map v)) (g (hmn-track! m)))
                         (map (lambda (k) (hm-node* m k g)) (hm-keys-ordered m)))))))
 (define (hmv-entry-kv e)
@@ -1902,7 +1901,7 @@
                             (if (eq? (hm-ff-kind m) 'end)
                                 (hm-walk m (lambda (k v) (jolt-fi-call f "accept" (hmv-project kind m k))))
                                 (jutil-walk-for-each (jx-call self "iterator" '()) f)))))))
-(define (hmv-has-value? m v) (exists (lambda (k) (hm-veq? m v (hmv-ref m k))) (hm-keys-ordered m)))
+(define (hmv-has-value? m v) (exists (lambda (kv) (hm-veq? m v (cdr kv))) (hm-pairs-ordered m)))
 (for-each
   (lambda (f)
     (let* ((p (car f)) (owner (cadr f)) (t (lambda (sfx) (string-append p sfx))))
@@ -1942,7 +1941,7 @@
 (define (map-entries-of x)
   ;; (k . v) pairs of any map value
   (if (hm-hashmap? x)
-      (map (lambda (k) (cons k (hashtable-ref (hm-tbl x) k jolt-nil))) (hm-keys-ordered x))
+      (hm-pairs-ordered x)
       (map (lambda (e) (cons (jolt-nth e 0) (jolt-nth e 1))) (seq->list (jolt-seq x)))))
 (define (map-value? x) (or (hm-hashmap? x) (jolt-map? x) (eq? (jutil-coll-kind x) 'map)))
 (define (ihm-equals? m o)
@@ -1997,22 +1996,31 @@
       (let ((ks (vector-ref st 1)))
         (when (and (pair? ks) (not (hashtable-contains? t (car ks))))
           (vector-set! st 1 (cdr ks)) (loop))))))
-(define (wv-node m k) (make-jhost "jx-chm-entry" (vector m k (hmv-ref m k))))
-(define (wv-project kind m k) (case kind ((key) k) ((value) (hmv-ref m k)) (else (wv-node m k))))
+;; Each walk takes the keys and values together (hm-pairs-ordered, under a
+;; ConcurrentHashMap's monitor), so it never pairs a key with the nil a racing
+;; remove left.
+(define (wv-node m k v) (make-jhost "jx-chm-entry" (vector m k v)))
+(define (wv-project kind m k v) (case kind ((key) k) ((value) v) (else (wv-node m k v))))
 (define (wv-elems kind)
   (case kind
-    ((entry) (lambda (v) (let ((m (hmv-map v))) (map (lambda (k) (wv-node m k)) (hm-keys-ordered m)))))
+    ((entry) (lambda (v) (let ((m (hmv-map v))) (map (lambda (kv) (wv-node m (car kv) (cdr kv))) (hm-pairs-ordered m)))))
     (else (hmv-elems kind))))
+(define wv-absent (list 'absent))
 (define wv-iterator-methods
   (list (cons "hasNext" (lambda (self) (let ((st (jhost-state self))) (wv-live! st) (pair? (vector-ref st 1)))))
+        ;; a key a racing remove took after wv-live! is passed over
         (cons "next" (lambda (self)
                        (let ((st (jhost-state self)))
-                         (wv-live! st)
-                         (let ((ks (vector-ref st 1)))
-                           (when (null? ks) (throw-jvm 'NoSuchElementException jolt-nil))
-                           (vector-set! st 1 (cdr ks))
-                           (vector-set! st 2 (car ks))
-                           (wv-project (vector-ref st 3) (vector-ref st 0) (car ks))))))
+                         (let loop ()
+                           (wv-live! st)
+                           (let ((ks (vector-ref st 1)))
+                             (when (null? ks) (throw-jvm 'NoSuchElementException jolt-nil))
+                             (vector-set! st 1 (cdr ks))
+                             (let ((v (hashtable-ref (hm-tbl (vector-ref st 0)) (car ks) wv-absent)))
+                               (if (eq? v wv-absent)
+                                   (loop)
+                                   (begin (vector-set! st 2 (car ks))
+                                          (wv-project (vector-ref st 3) (vector-ref st 0) (car ks) v)))))))))
         (cons "remove" (lambda (self)
                          (let ((st (jhost-state self)))
                            (when (eq? (vector-ref st 2) jutil-iterator-none) (throw-jvm 'IllegalStateException jolt-nil))
@@ -2027,10 +2035,13 @@
             (jx-class! (car r) (cadr r) '("java.util.Iterator"))
             (register-host-methods! (car r) wv-iterator-methods)
             (jx-register! (car r) 'iter
-                          (lambda (it) (let ((st (jhost-state it)))
+                          (lambda (it) (let* ((st (jhost-state it)) (t (hm-tbl (vector-ref st 0))))
                                          (wv-live! st)
-                                         (map (lambda (k) (wv-project (vector-ref st 3) (vector-ref st 0) k))
-                                              (filter (lambda (k) (hashtable-contains? (hm-tbl (vector-ref st 0)) k)) (vector-ref st 1)))))
+                                         (fold-right (lambda (k acc)
+                                                       (let ((v (hashtable-ref t k wv-absent)))
+                                                         (if (eq? v wv-absent) acc
+                                                             (cons (wv-project (vector-ref st 3) (vector-ref st 0) k v) acc))))
+                                                     '() (vector-ref st 1))))
                           #f #f #f))
           '(("jx-chm-key-itr" "java.util.concurrent.ConcurrentHashMap$KeyIterator")
             ("jx-chm-value-itr" "java.util.concurrent.ConcurrentHashMap$ValueIterator")
@@ -2058,12 +2069,17 @@
   (let ((d (vector-ref (jhost-state self) 1)))
     (if (jolt-nil? d) (jx-uoe)
         (let ((m (hmv-map self)))
-          (if (hashtable-contains? (hm-tbl m) k) #f (begin (jx-call m "put" (list k d)) #t))))))
+          (jolt-nil? (jx-call m "putIfAbsent" (list k d)))))))
 (define wv-key-has (lambda (m k) (hashtable-contains? (hm-tbl m) k)))
-(define wv-key-remove (lambda (m k) (and (hashtable-contains? (hm-tbl m) k) (begin (hmv-remove-key! m k) #t))))
-(define wv-value-remove (lambda (m v) (let ((k (find (lambda (k) (jolt=2 v (hmv-ref m k))) (hm-keys-ordered m))))
-                                        (if k (begin (hmv-remove-key! m k) #t) #f))))
-(define wv-entry-remove (lambda (m e) (if (hmv-has-entry? m e) (begin (hmv-remove-key! m (car (hmv-entry-kv e))) #t) #f)))
+;; each removal is one call of the map's, so a racing write cannot slip between
+;; finding the mapping and removing it
+(define wv-key-remove (lambda (m k) (not (jolt-nil? (hmv-remove-key! m k)))))
+(define wv-value-remove (lambda (m v) (let loop ((kvs (hm-pairs-ordered m)))
+                                        (cond ((null? kvs) #f)
+                                              ((and (jolt=2 v (cdar kvs)) (jx-call m "remove" (list (caar kvs) (cdar kvs)))) #t)
+                                              (else (loop (cdr kvs)))))))
+(define wv-entry-remove (lambda (m e) (let ((kv (hmv-entry-kv e)))
+                                        (and kv (not (jolt-nil? (car kv))) (jx-call m "remove" (list (car kv) (cdr kv))) #t))))
 (for-each
   (lambda (r)
     (let ((tag (car r)) (cls (cadr r)) (kind (caddr r)) (supers (cadddr r)))

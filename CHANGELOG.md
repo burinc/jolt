@@ -218,6 +218,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the key that `computeIfAbsent` (or `compute` over an absent key) is computing,
   made from inside its function, is `IllegalStateException` "Recursive update",
   as on the JDK; reads and other keys go through.
+- **`ConcurrentHashMap` is thread-safe.** Writes from several threads lost
+  entries, could drive `size` negative and could corrupt the table. Every write
+  now holds the map's lock, compute functions run outside it with only their key
+  held, so another thread writing that key waits while other keys go through,
+  and walks (`seq`, the views, `forEach`) see each key with its value, never the
+  nil a racing remove left. Single-threaded speed is unchanged.
+- **`ConcurrentHashMap` refuses nil everywhere the JDK does**: `replace`,
+  `putAll`, `merge`, `getOrDefault`, the compute family and the copy
+  constructor throw `NullPointerException` instead of storing or ignoring it.
+  `mappingCount` is there.
+- **`Properties.remove(key, value)`** was missing; it removes the key only
+  when it is mapped to that value.
+- **`ArrayDeque.addAll`** of the deque itself throws
+  `ConcurrentModificationException` after adding the elements again, and of nil
+  throws `NullPointerException`, as the JDK's does.
 - **`(seq a-HashMap)` yields the map's own entries** (jolt-12zv0):
   `HashMap$Node`, `ConcurrentHashMap$MapEntry`, `IdentityHashMap`'s and
   `WeakHashMap`'s entries, in the map's iteration order, live and printing as

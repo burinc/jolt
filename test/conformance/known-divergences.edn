@@ -1718,7 +1718,7 @@
    :check {:expr "(let [m (java.util.concurrent.ConcurrentHashMap.)] (try (.computeIfAbsent m 1 (reify java.util.function.Function (apply [_ k] (.put m 17 :x) :v))) (into (sorted-map) m) (catch IllegalStateException e (.getMessage e))))"
            :jvm "\"Recursive update\""
            :jolt "{1 :v, 17 :x}"}
-   :note "Which keys share a bin is the JDK's table layout (spread hashCode masked by a capacity that grows). jolt has no such layout, so it refuses exactly the writes the JDK refuses for any layout: those to the key being computed. A write to the computed key, any write from inside compute over an absent key, and nested computeIfAbsent of the same key match the JDK (corpus)."}
+   :note "Which keys share a bin is the JDK's table layout (spread hashCode masked by a capacity that grows). jolt has no such layout, so it refuses exactly the writes the JDK refuses for any layout: those to the key being computed. A write to the computed key, any write from inside compute over an absent key, and nested computeIfAbsent of the same key match the JDK (corpus). For the same reason another thread's write waits, while a compute function runs, only when it is to the computed key, where the JDK's waits for any key in that bin."}
   {:category :string-model
    :behavior "an empty string made by new String"
    :jvm "a new object each time"
