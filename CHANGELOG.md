@@ -249,6 +249,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   held, so another thread writing that key waits while other keys go through,
   and walks (`seq`, the views, `forEach`) see each key with its value, never the
   nil a racing remove left. Single-threaded speed is unchanged.
+- **A `ConcurrentHashMap` iterator reads its next entry ahead**, as the JDK's
+  does, so `next` after a `hasNext` that answered true never throws
+  `NoSuchElementException` when another thread removes keys in between.
 - **`ConcurrentHashMap` refuses nil everywhere the JDK does**: `replace`,
   `putAll`, `merge`, `getOrDefault`, the compute family and the copy
   constructor throw `NullPointerException` instead of storing or ignoring it.
