@@ -1988,14 +1988,28 @@
 ;; throws ConcurrentModificationException; it walks the keys present when it
 ;; started, skipping any removed since. keySet(default) is a view whose add puts
 ;; the key mapped to that default. State #(map default); an iterator's
-;; #(map remaining last kind).
-(define (wv-live! st)
-  ;; drop the leading keys the map no longer holds
-  (let ((t (hm-tbl (vector-ref st 0))))
-    (let loop ()
-      (let ((ks (vector-ref st 1)))
-        (when (and (pair? ks) (not (hashtable-contains? t (car ks))))
-          (vector-set! st 1 (cdr ks)) (loop))))))
+;; #(map remaining last kind pending).
+;;
+;; An iterator reads its next entry AHEAD, as the JDK's Traverser does: hasNext
+;; finds the next key still in the map and keeps it with the value it read
+;; (pending, a (key . value) pair), and next hands that out. So once hasNext has
+;; answered true, next cannot find the map emptied under it by another thread
+;; and throw NoSuchElementException; a key removed after it was read ahead is
+;; still handed out, as the JDK's weak consistency allows.
+(define wv-absent (list 'absent))
+(define (wv-advance! st)
+  ;; -> the pending (key . value), reading ahead past keys removed since the
+  ;; walk began, or #f at the end
+  (or (vector-ref st 4)
+      (let ((t (hm-tbl (vector-ref st 0))))
+        (let loop ()
+          (let ((ks (vector-ref st 1)))
+            (and (pair? ks)
+                 (let ((v (hashtable-ref t (car ks) wv-absent)))
+                   (vector-set! st 1 (cdr ks))
+                   (if (eq? v wv-absent)
+                       (loop)
+                       (let ((kv (cons (car ks) v))) (vector-set! st 4 kv) kv)))))))))
 ;; Each walk takes the keys and values together (hm-pairs-ordered, under a
 ;; ConcurrentHashMap's monitor), so it never pairs a key with the nil a racing
 ;; remove left.
@@ -2005,22 +2019,14 @@
   (case kind
     ((entry) (lambda (v) (let ((m (hmv-map v))) (map (lambda (kv) (wv-node m (car kv) (cdr kv))) (hm-pairs-ordered m)))))
     (else (hmv-elems kind))))
-(define wv-absent (list 'absent))
 (define wv-iterator-methods
-  (list (cons "hasNext" (lambda (self) (let ((st (jhost-state self))) (wv-live! st) (pair? (vector-ref st 1)))))
-        ;; a key a racing remove took after wv-live! is passed over
+  (list (cons "hasNext" (lambda (self) (if (wv-advance! (jhost-state self)) #t #f)))
         (cons "next" (lambda (self)
-                       (let ((st (jhost-state self)))
-                         (let loop ()
-                           (wv-live! st)
-                           (let ((ks (vector-ref st 1)))
-                             (when (null? ks) (throw-jvm 'NoSuchElementException jolt-nil))
-                             (vector-set! st 1 (cdr ks))
-                             (let ((v (hashtable-ref (hm-tbl (vector-ref st 0)) (car ks) wv-absent)))
-                               (if (eq? v wv-absent)
-                                   (loop)
-                                   (begin (vector-set! st 2 (car ks))
-                                          (wv-project (vector-ref st 3) (vector-ref st 0) (car ks) v)))))))))
+                       (let* ((st (jhost-state self)) (kv (wv-advance! st)))
+                         (unless kv (throw-jvm 'NoSuchElementException jolt-nil))
+                         (vector-set! st 4 #f)
+                         (vector-set! st 2 (car kv))
+                         (wv-project (vector-ref st 3) (vector-ref st 0) (car kv) (cdr kv)))))
         (cons "remove" (lambda (self)
                          (let ((st (jhost-state self)))
                            (when (eq? (vector-ref st 2) jutil-iterator-none) (throw-jvm 'IllegalStateException jolt-nil))
@@ -2035,13 +2041,15 @@
             (jx-class! (car r) (cadr r) '("java.util.Iterator"))
             (register-host-methods! (car r) wv-iterator-methods)
             (jx-register! (car r) 'iter
-                          (lambda (it) (let* ((st (jhost-state it)) (t (hm-tbl (vector-ref st 0))))
-                                         (wv-live! st)
-                                         (fold-right (lambda (k acc)
-                                                       (let ((v (hashtable-ref t k wv-absent)))
-                                                         (if (eq? v wv-absent) acc
-                                                             (cons (wv-project (vector-ref st 3) (vector-ref st 0) k v) acc))))
-                                                     '() (vector-ref st 1))))
+                          ;; what is left: the pending entry, then the rest as they stand now
+                          (lambda (it) (let* ((st (jhost-state it)) (t (hm-tbl (vector-ref st 0)))
+                                              (pending (vector-ref st 4)))
+                                         (define (project kv) (wv-project (vector-ref st 3) (vector-ref st 0) (car kv) (cdr kv)))
+                                         (let ((rest (fold-right (lambda (k acc)
+                                                                   (let ((v (hashtable-ref t k wv-absent)))
+                                                                     (if (eq? v wv-absent) acc (cons (cons k v) acc))))
+                                                                 '() (vector-ref st 1))))
+                                           (map project (if pending (cons pending rest) rest)))))
                           #f #f #f))
           '(("jx-chm-key-itr" "java.util.concurrent.ConcurrentHashMap$KeyIterator")
             ("jx-chm-value-itr" "java.util.concurrent.ConcurrentHashMap$ValueIterator")
@@ -2058,7 +2066,7 @@
                              (vector-set! st 2 v)
                              old)))))
 (define (wv-iterator kind tag)
-  (lambda (self) (let ((m (hmv-map self))) (make-jhost tag (vector m (hm-keys-ordered m) jutil-iterator-none kind)))))
+  (lambda (self) (let ((m (hmv-map self))) (make-jhost tag (vector m (hm-keys-ordered m) jutil-iterator-none kind #f)))))
 (define (wv-common kind itr-tag has? remove!)
   ;; hmv-common's view methods over a weakly consistent iterator (later wins)
   (append (hmv-common kind itr-tag has? remove!)
