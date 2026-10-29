@@ -30,11 +30,21 @@
 ;; "/srv/sh" names a directory on the current drive instead. POSIX has no root
 ;; to protect (FROM is 0 there), so "//a/b" still folds to "/a/b" as the JVM
 ;; does — the row win-path-test.ss already pins.
-(define (path-has-double-sep? p n from)
-  (let loop ((i (fxmax 1 from)))
-    (and (fx<? i n)
-         (or (and (char=? (string-ref p i) #\/) (char=? (string-ref p (fx- i 1)) #\/))
-             (loop (fx+ i 1))))))
+;;
+;; With NUL? the same pass also looks for a NUL anywhere in p and answers 'nul
+;; for one, so a java.nio Path (which refuses a NUL as it parses) pays no second
+;; scan for it; without, it stops at the first doubled separator. The walk is
+;; unchecked: p is a string and i stays below its length.
+(define (path-has-double-sep? p n from nul?)
+  (let ((lo (fxmax 1 from)))
+    (let loop ((i 0) (dbl #f) (prev-slash? #f))
+      (if (sa-ufx<? i n)
+          (let ((c (sa-ustring-ref p i)))
+            (cond ((and nul? (eq? c #\nul)) 'nul)
+                  ((and (eq? c #\/) prev-slash? (sa-ufx>=? i lo))
+                   (if nul? (loop (sa-ufx+ i 1) #t #t) #t))
+                  (else (loop (sa-ufx+ i 1) dbl (eq? c #\/)))))
+          dbl))))
 
 ;; May the trailing separator at index N-1 be dropped? Not when it IS the root:
 ;; "/" is a path rather than an empty one, and on Windows so is the drive root
@@ -89,18 +99,23 @@
 (define (fs-exception-message file other reason)
   (fs-exception-message-for (eq? (sa-os-family) 'windows) file other reason))
 
-(define (jolt-path-normalize-for windows? p0)
+(define (jolt-path-normalize-for windows? p0) (path-normalize* windows? p0 #f))
+;; The same, or 'nul when p0 holds a NUL (nio-file.ss npath-held-for).
+(define (jolt-path-normalize-for/nul windows? p0) (path-normalize* windows? p0 #t))
+(define (path-normalize* windows? p0 nul?)
   (define (trailing-sep-droppable? p n) (trailing-sep-droppable-for? windows? p n))
   (let* ((p (if windows? (path-backslashes->slashes p0) p0))
          (n (string-length p))
          ;; POSIX classifies nothing as a root here, so its answers are exactly
          ;; what they were; only Windows has a prefix to hold back.
          (root-end (if windows? (path-root-end #t p) 0)))
+    (let ((scan (path-has-double-sep? p n root-end nul?)))
     (cond
+      ((eq? scan 'nul) 'nul)
       ;; an already-normal path is the overwhelmingly common case, and a jfile is
       ;; built per entry on every directory listing: look before copying, so the
       ;; answer is p itself and nothing is allocated
-      ((not (path-has-double-sep? p n root-end))
+      ((not scan)
        (if (trailing-sep-droppable? p n)
            (substring p 0 (fx- n 1))
            p))
@@ -129,7 +144,7 @@
                (let ((c (string-ref p i)))
                  (cond ((and (char=? c #\/) prev-slash?) (loop (fx+ i 1) j #t))
                        (else (string-set! out j c)
-                             (loop (fx+ i 1) (fx+ j 1) (char=? c #\/))))))))))))
+                             (loop (fx+ i 1) (fx+ j 1) (char=? c #\/)))))))))))))
 (define (jolt-path-normalize p)
   (jolt-path-normalize-for (eq? (sa-os-family) 'windows) p))
 

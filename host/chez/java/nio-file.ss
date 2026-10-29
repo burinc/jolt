@@ -189,8 +189,11 @@
 ;; One place Path and File normalize differently, and it is the JDK's: a UNC root
 ;; alone keeps its trailing separator as a Path ("\\\\srv\\sh\\", what
 ;; WindowsPathParser answers) where java.io.File drops it ("\\\\srv\\sh").
-(define (npath-held-for windows? s)
-  (let ((n (jolt-path-normalize-for windows? s)))
+(define (npath-held-for windows? s . refuse-nul)
+  (let ((n (if (null? refuse-nul)
+               (jolt-path-normalize-for windows? s)
+               (jolt-path-normalize-for/nul windows? s))))
+    (when (eq? n 'nul) (npath-refuse-nul windows? s))
     (if (and windows? (fx>? (string-length n) 2) (string=? (substring n 0 2) "//"))
         (let ((pp (path-parse #t n)))
           (if (null? (ppath-segs pp)) (ppath-root pp) n))
@@ -249,15 +252,26 @@
       (hashtable-ref nio-fs-providers (jhost-tag fs) default-nio-provider)))
 (define (nio-fs-windows? fs) ((nio-provider-windows? (nio-fs-provider fs))))
 
-;; A path string with a NUL names no file: the JDK's UnixPath refuses it as it
-;; parses, so Paths/get, Path/of, File.toPath and resolve all raise rather than
-;; hand the C layer a path it would truncate at the NUL, acting on another file.
+;; A path string with a NUL names no file: the JDK's UnixPath (and WindowsPath,
+;; in its own words) refuses it as it parses, so Paths/get, Path/of, File.toPath
+;; and resolve all raise rather than hand the C layer a path it would truncate
+;; at the NUL, acting on another file. The normalizing scan finds it, so a
+;; well-formed path pays no second pass.
+(define (npath-refuse-nul windows? s)
+  (throw-jvm 'java.nio.file.InvalidPathException
+             (if windows?
+                 (let loop ((i 0))
+                   (if (char=? (string-ref s i) #\nul)
+                       (string-append "Illegal char <" (string #\nul) "> at index "
+                                      (number->string i) ": " s)
+                       (loop (fx+ i 1))))
+                 (string-append "Nul character not allowed: " s))))
 (define (make-nio-path-on fs s)
-  (when (and (eq? fs default-nio-filesystem) (jfile-nul? s))
-    (throw-jvm 'java.nio.file.InvalidPathException (string-append "Nul character not allowed: " s)))
   (make-jhost "nio-path"
-              (cons fs (npath-held-for (nio-fs-windows? fs)
-                                       (if (string? s) s (npath-string-of s))))))
+              (cons fs (let ((w? (nio-fs-windows? fs)) (str (if (string? s) s (npath-string-of s))))
+                         (if (eq? fs default-nio-filesystem)
+                             (npath-held-for w? str #t)
+                             (npath-held-for w? str))))))
 (define (make-nio-path s) (make-nio-path-on default-nio-filesystem s))
 (define (nio-path? x) (and (jhost? x) (string=? (jhost-tag x) "nio-path")))
 (define (nio-path-str p) (cdr (jhost-state p)))
