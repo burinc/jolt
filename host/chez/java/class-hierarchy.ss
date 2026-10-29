@@ -595,7 +595,13 @@
                                              "clojure.lang.Obj" "clojure.lang.IHashEq"))
 (jch-register-supers! "clojure.lang.PersistentList" '("clojure.lang.ASeq" "clojure.lang.IPersistentList" "java.util.List" "clojure.lang.Counted"
                                                       "clojure.lang.IReduce"))
-(jch-register-supers! "clojure.lang.PersistentList$EmptyList" '("clojure.lang.PersistentList"))
+;; EmptyList is a static nested class of PersistentList, not a subclass: it
+;; extends Obj and implements the list interfaces itself, so () is not a
+;; PersistentList, an ASeq or an IReduce, and a protocol extended to either does
+;; not reach it.
+(jch-register-supers! "clojure.lang.PersistentList$EmptyList"
+                      '("clojure.lang.Obj" "clojure.lang.IPersistentList" "java.util.List" "clojure.lang.ISeq"
+                        "clojure.lang.Counted" "clojure.lang.IHashEq"))
 (jch-register-supers! "clojure.lang.LazySeq" '("clojure.lang.ISeq" "clojure.lang.Sequential" "java.util.List" "clojure.lang.IObj"
                                                  "clojure.lang.Obj" "clojure.lang.IHashEq"))
 (jch-register-supers! "clojure.lang.Cons" '("clojure.lang.ASeq"))
@@ -615,7 +621,7 @@
 ;; A vector's own seq: Counted is real here — jolt-count reads (pvec-count - ci)
 ;; without walking, exactly what Counted promises (collections.ss jolt-count).
 (jch-register-supers! "clojure.lang.PersistentVector$ChunkedSeq"
-                      '("clojure.lang.ASeq" "clojure.lang.Counted"))
+                      '("clojure.lang.ASeq" "clojure.lang.Counted" "clojure.lang.IReduce"))
 ;; A standalone chunk plus an arbitrary, possibly lazy rest. NOT Counted — its
 ;; length is unknown without forcing, and ChunkedCons is not Counted on the JVM either.
 (jch-register-supers! "clojure.lang.ChunkedCons" '("clojure.lang.ASeq"))
@@ -624,15 +630,16 @@
 ;; walking, as Counted promises — the JVM's ArraySeq and StringSeq are Counted
 ;; through IndexedSeq, and RSeq directly. IndexedSeq itself is not claimed: it
 ;; also promises index(), which nothing here answers.
-(jch-register-supers! "clojure.lang.ArraySeq" '("clojure.lang.ASeq" "clojure.lang.Counted"))
+(jch-register-supers! "clojure.lang.ArraySeq" '("clojure.lang.ASeq" "clojure.lang.Counted" "clojure.lang.IReduce"))
 (for-each (lambda (prim) (jch-register-supers! (string-append "clojure.lang.ArraySeq$ArraySeq_" prim)
                                                '("clojure.lang.ArraySeq")))
           '("int" "long" "short" "double" "float" "boolean" "byte" "char"))
-(jch-register-supers! "clojure.lang.StringSeq" '("clojure.lang.ASeq" "clojure.lang.Counted"))
+;; StringSeq reduces itself only from an init: IReduceInit, not IReduce
+(jch-register-supers! "clojure.lang.StringSeq" '("clojure.lang.ASeq" "clojure.lang.Counted" "clojure.lang.IReduceInit"))
 (jch-register-supers! "clojure.lang.APersistentVector$RSeq" '("clojure.lang.ASeq" "clojure.lang.Counted"))
 ;; The map/set seq views. PersistentArrayMap$Seq is Counted on the JVM; jolt
 ;; materializes it into a cell chain, so it is not claimed here either.
-(jch-register-supers! "clojure.lang.PersistentArrayMap$Seq" '("clojure.lang.ASeq"))
+(jch-register-supers! "clojure.lang.PersistentArrayMap$Seq" '("clojure.lang.ASeq" "clojure.lang.IReduce"))
 (jch-register-supers! "clojure.lang.PersistentHashMap$NodeSeq" '("clojure.lang.ASeq"))
 (jch-register-supers! "clojure.lang.PersistentTreeMap$Seq" '("clojure.lang.ASeq"))
 (jch-register-supers! "clojure.lang.APersistentMap$KeySeq" '("clojure.lang.ASeq"))
@@ -806,6 +813,7 @@
 (jch-register-supers! "java.nio.file.FileSystemAlreadyExistsException" '("java.lang.RuntimeException"))
 (jch-register-supers! "java.nio.file.ProviderNotFoundException" '("java.lang.RuntimeException"))
 (jch-register-supers! "java.nio.file.ProviderMismatchException" '("java.lang.IllegalArgumentException"))
+(jch-register-supers! "java.nio.file.InvalidPathException" '("java.lang.IllegalArgumentException"))
 (jch-register-supers! "java.nio.file.ClosedFileSystemException" '("java.lang.IllegalStateException"))
 (jch-register-supers! "java.nio.file.ClosedWatchServiceException" '("java.lang.IllegalStateException"))
 (jch-register-supers! "java.nio.file.ReadOnlyFileSystemException" '("java.lang.UnsupportedOperationException"))

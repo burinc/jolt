@@ -153,8 +153,11 @@
 (define (doseq-block-end s)
   (let ((v (cseq-cvec s)))
     (if (cseq-crest s) (pvec-count v) (fxmin (fx+ (cseq-ci s) seq-chunk-size) (pvec-count v)))))
+;; Asked once of every seq a doseq walks, so the sealed cseqv? goes first: a
+;; list's cell (a cseqn) or a lazy seq answers nil on one record-type compare,
+;; where cseq? walked the parent chain and the kind test ran before it.
 (define (doseq-chunk-vec s)
-  (if (and (cseq? s) (sk-chunked? (cseq-kind s)) (cseq-cvec s))
+  (if (and (cseqv? s) (sk-chunked? (cseq-kind s)))
       (let ((v (cseq-cvec s)) (i (cseq-ci s)))
         (if (fx>=? i (pv-tailoff-of v))
             (pvec-tail v)               ; a short vector is all tail: no descent

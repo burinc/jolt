@@ -800,15 +800,16 @@ fi
 # dropped local, so the image maker the site calls hit an unbound variable (the
 # ray tracer's "variable vertical is not bound"); moved under a let/loop/fn/catch
 # binder that rebinds a local they read, they computed the wrong value (12 and
-# 5 for 3 and 6). Every build gets the pass, so the default build is the one
-# checked.
+# 5 for 3 and 6). A field value that allocates, moved to two reads (or one read
+# in a loop body), made a new object per read where the binding held one.
+# Every build gets the pass, so the default build is the one checked.
 scalar_capture_app="$root/test/chez/scalar-capture-app"
 scalar_capture_out="$(dirname "$out")/scalar-capture-bin"
 if ! JOLT_PWD="$scalar_capture_app" "$jolt" build -m app.core -o "$scalar_capture_out" >/dev/null 2>&1; then
   echo "  FAIL: scalar-capture build exited non-zero"; exit 1
 fi
 scalar_capture_got="$(cd "$scalar_capture_app" && "$scalar_capture_out" 2>&1)"
-scalar_capture_want="$(printf '16\n3\n6\n[3 3]\n3')"
+scalar_capture_want="$(printf '16\n3\n6\n[3 3]\n3\n[true true 2 2]\ntrue')"
 if [ "$scalar_capture_got" != "$scalar_capture_want" ]; then
   echo "  FAIL: scalar-replace moved field args out of scope — got \`$scalar_capture_got\`, want \`$scalar_capture_want\`"; exit 1
 fi

@@ -215,7 +215,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deleted `notes.txt`, and `exists`, `length`, `list` and the rest answered
   for it. They now give the JDK's answers for an invalid path (false, 0, nil),
   and `createNewFile`, `slurp`, `spit` and the file streams raise "Invalid file
-  path". `Paths/get` still accepts one (jolt-jg8tx).
+  path". `Paths/get`, `Path/of`, `.toPath` and `resolve` raise
+  `InvalidPathException` "Nul character not allowed", as the JDK's do.
+- **`.reduce` follows the class's interfaces.** A vector's seq, an array's
+  seq and an array map's seq are `IReduce` and reduce themselves, a string seq
+  is `IReduceInit` and reduces only from an init, and a set's, a sorted coll's
+  or a hash map's seq, `keys`/`vals`, a `ChunkedCons`, a subvec and a map entry
+  raise `IllegalArgumentException`, as on the JVM.
+- **`()` is a `PersistentList$EmptyList` only.** It reported itself a
+  `PersistentList` and an `ASeq` (and so `IReduce`), which it is not on the
+  JVM; a protocol extended to `PersistentList` no longer reaches it.
+- **`(empty map-entry)` is nil**, as `MapEntry.empty()` is; it was `[]`.
+- **`transient` refuses a sorted map or set** with the JVM's
+  `ClassCastException`; it answered a copy-on-write transient.
+- **A `reduced` box prints** as `#object[clojure.lang.Reduced 0x… {:status
+  :ready, :val 1}]`, and `str` is `clojure.lang.Reduced@hash`.
+- **A built binary keeps a struct field's object identity.** Scalar
+  replacement moved a dropped map or record binding's field value to every
+  read, so a value that allocates (a vector, a nested map) became a new object
+  per read, and per loop iteration: `(identical? (:x m) (:x m))` was false.
+  Such a value is now bound once where the struct was.
 - **`HashMap` and `HashSet` `remove` is O(1)** (jolt-lfm8p). It rebuilt the
   map's insertion-order key list, so one removal from a 20k-entry map cost
   ~112us; it now leaves a stale entry the walk skips, and the list is rebuilt

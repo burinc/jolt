@@ -28,7 +28,7 @@
   :restrictive
   "the JVM supports something jolt does not: mark/reset replay over a non-seekable stream, a Zip64 entry in a ZipInputStream. The narrow direction, so it is NOT a superset — code relying on the JVM capability has no counterpart here",
   :permissive
-  "jolt succeeds where the JVM throws, on operations with one reasonable meaning: count works on eduction, keys on a vector of pairs, (empty MapEntry) => []. A superset: portable JVM code behaves identically.",
+  "jolt succeeds where the JVM throws, on operations with one reasonable meaning: count works on eduction, keys on a vector of pairs. A superset: portable JVM code behaves identically.",
   :namespace-model
   "jolt's namespace layer is permissive where the JVM's has no useful answer: a namespace made by a bare in-ns still sees clojure.core, a load cycle completes, and a late-bound host static is resolved at the call. A superset — code that resolves on the JVM resolves on jolt.",
   :deps-model
@@ -1832,7 +1832,6 @@
    ;; one-char string holding the unpaired half. Same model as the astral entries
    ;; above, at read time rather than at index time.
    {:suite "reader / surrogate in string", :label "\\ud800 in string throws Invalid character constant", :category :string-model}
-   {:suite "permissive / empty MapEntry", :label "empty of a map entry", :category :permissive}
 
    ;; ==========================================================================
    ;; Rows where the JVM RAN the program and RAISED while jolt answers a value
