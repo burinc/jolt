@@ -926,9 +926,31 @@
 ;; insertion order for iteration (seq/keySet/values/entrySet render
 ;; deterministically; the JVM's hash order is arbitrary, insertion order is the
 ;; deterministic superset jolt's small maps already use).
+;; The slot holds the keys newest first, as a plain list, until the map's first
+;; removal of a key that is not its newest (jolt-lfm8p: filtering the list then
+;; made every such remove linear in the map). Such a removal turns the slot into
+;; an hm-idx: the keys as cells (key . live?), newest first, and a table from key
+;; to cell. remove clears its key's cell and drops it from the table, a new key
+;; pushes a cell, and a walk keeps the live cells, so a returning key sits where
+;; it was last inserted, as before. Dead cells are swept once they outnumber live
+;; keys, keeping remove amortized O(1). A map that never removes, or only pops its
+;; newest key, keeps the plain list and pays nothing for this.
+(define-record-type hm-idx (fields (mutable cells) index (mutable dead)))
 (define (hm-ord self) (vector-ref (jhost-state self) 1))
 (define (hm-ord! self v) (vector-set! (jhost-state self) 1 v))
-(define (hm-state tbl ord) (vector tbl ord 0))
+(define (hm-idx-live-keys o)            ; oldest first
+  (let loop ((cs (hm-idx-cells o)) (acc '()))
+    (cond ((null? cs) acc)
+          ((cdar cs) (loop (cdr cs) (cons (caar cs) acc)))
+          (else (loop (cdr cs) acc)))))
+(define (hm-idx-sweep! o)
+  (hm-idx-cells-set! o (filter cdr (hm-idx-cells o)))
+  (hm-idx-dead-set! o 0))
+(define (hm-list->idx self ks)          ; ks newest first, all live
+  (let ((ix (hm-like-table self)))
+    (make-hm-idx (map (lambda (k) (let ((c (cons k #t))) (hashtable-set! ix k c) c)) ks) ix 0)))
+;; slot 3 is a ConcurrentHashMap's reservations (chm-reserving); '() elsewhere
+(define (hm-state tbl ord) (vector tbl ord 0 '()))
 (define (hm-mc self) (vector-ref (jhost-state self) 2))
 (define-syntax hm-bump!
   ;; inline: every new key and every removal pays it
@@ -943,7 +965,14 @@
 (define (hm-note-key! self k)
   (when (not (hashtable-contains? (hm-tbl self) k))
     (hm-bump! self)
-    (hm-ord! self (if (hm-weak? self) (list 'v) (cons k (hm-ord self))))))
+    (if (hm-weak? self)
+        (hm-ord! self (list 'v))
+        (let ((o (hm-ord self)))
+          (if (hm-idx? o)
+              (let ((c (cons k #t)))
+                (hashtable-set! (hm-idx-index o) k c)
+                (hm-idx-cells-set! o (cons c (hm-idx-cells o))))
+              (hm-ord! self (cons k o)))))))
 ;; values compare as the map's keys do: by identity in an IdentityHashMap
 (define (hm-veq? self a b)
   (if (eq? (hashtable-equivalence-function (hm-tbl self)) eq?) (eq? a b) (jolt=2 a b)))
@@ -960,10 +989,32 @@
 (define (hm-drop-key! self k)
   (when hm-detach-hook (hm-detach-hook self k))
   (hm-bump! self)
-  ;; by the table's own key equivalence: two equal keys are two keys in an IdentityHashMap
-  (hm-ord! self (if (hm-weak? self) (list 'v)
-                    (let ((same? (hashtable-equivalence-function (hm-tbl self))))
-                      (remove (lambda (e) (same? e k)) (hm-ord self))))))
+  ;; k is already out of the table. Popping the newest key (a stack-like use)
+  ;; leaves a plain list plain; the front check goes by the table's own key
+  ;; equivalence (two equal keys are two keys in an IdentityHashMap).
+  (if (hm-weak? self)
+      (hm-ord! self (list 'v))
+      (let ((o (hm-ord self)))
+        (if (hm-idx? o)
+            (let ((c (hashtable-ref (hm-idx-index o) k #f)))
+              (when c
+                (hashtable-delete! (hm-idx-index o) k)
+                (if (eq? c (car (hm-idx-cells o)))
+                    (hm-idx-cells-set! o (cdr (hm-idx-cells o)))
+                    (let ((n (fx+ (hm-idx-dead o) 1)))
+                      (set-cdr! c #f)
+                      (hm-idx-dead-set! o n)
+                      (when (fx>? n (fx+ (hashtable-size (hm-tbl self)) 32)) (hm-idx-sweep! o))))))
+            (cond ((null? o))
+                  (((hashtable-equivalence-function (hm-tbl self)) (car o) k) (hm-ord! self (cdr o)))
+                  (else
+                   ;; k's entry is still in the list: index the rest, then k's
+                   ;; cell goes dead like any later removal's
+                   (let* ((ix (hm-list->idx self o)) (c (hashtable-ref (hm-idx-index ix) k #f)))
+                     (hashtable-delete! (hm-idx-index ix) k)
+                     (set-cdr! c #f)
+                     (hm-idx-dead-set! ix 1)
+                     (hm-ord! self ix))))))))
 (define (hm-clear! self)
   (when hm-detach-hook (hm-detach-hook self hm-detach-hook))
   (hm-bump! self)
@@ -976,7 +1027,8 @@
       ;; order (known-divergences); the Map contract leaves it unspecified
       (map cdr (list-sort (lambda (a b) (< (car a) (car b)))
                           (map (lambda (k) (cons (hm-hash k) k)) (vector->list (hashtable-keys (hm-tbl self))))))
-      (reverse (hm-ord self))))
+      (let ((o (hm-ord self)))
+        (if (hm-idx? o) (hm-idx-live-keys o) (reverse o)))))
 ;; A hashmap-shaped jhost: the HashMap family and java.util.Properties, which is
 ;; a Hashtable with two string-typed accessors on top and so carries the same
 ;; #(table key-order) state. One predicate for every question about that shape —
@@ -1011,11 +1063,6 @@
       (when (and (pair? args) (not (number? (car args))))
         (hm-copy-into-ordered! self (car args)))
       self)))
-(define (hm->pmap self)
-  (let ((m (jolt-hash-map)))
-    (for-each (lambda (k) (set! m (jolt-assoc m k (hashtable-ref (hm-tbl self) k jolt-nil))))
-              (hm-keys-ordered self))
-    m))
 ;; How a HashMap-shaped map's own walks and compute methods answer a change
 ;; made under them: a HashMap checks its modCount once a forEach / replaceAll
 ;; walk ends and around each compute-family function; an IdentityHashMap and a
@@ -1274,20 +1321,74 @@
 (register-class-ctor! "java.util.concurrent.ConcurrentHashMap" make-chm-jhost)
 (define (chm-npe!) (throw-jvm 'NullPointerException jolt-nil))
 (define (chm-method name) (cdr (assoc name hashmap-methods)))
+;; While computeIfAbsent, or compute over an absent key, runs its function, the
+;; JDK holds a ReservationNode in the key's bin, and a write that reaches that
+;; bin from inside the function is IllegalStateException "Recursive update"
+;; (jolt-2gc66); reads and other bins go through. Slot 3 lists the keys being
+;; computed, each with the thread or fiber computing it: another thread's write
+;; waits for the bin on the JDK and is never refused. Which OTHER keys share the
+;; bin is the JDK's table layout, so only the reserved key itself is refused here
+;; (known-divergences).
+(define (chm-owner)
+  (let ((r (virtual-register jolt-vreg-current-fiber))) (if (eq? r 0) (get-thread-id) r)))
+(define (chm-reserved self) (vector-ref (jhost-state self) 3))
+(define (chm-check-key! self k)
+  (let ((rs (chm-reserved self)))
+    (unless (null? rs)
+      (let ((me (chm-owner)))
+        (when (exists (lambda (r) (and (eqv? (car r) me) (jolt=2 (cdr r) k))) rs)
+          (throw-jvm 'IllegalStateException "Recursive update"))))))
+(define (chm-reserving self k thunk)
+  (let ((r (cons (chm-owner) k)) (st (jhost-state self)))
+    (dynamic-wind
+      (lambda () (vector-set! st 3 (cons r (vector-ref st 3))))
+      thunk
+      (lambda () (vector-set! st 3 (remq r (vector-ref st 3)))))))
 ;; hashmap's methods, refusing a null key or value as ConcurrentHashMap does;
 ;; fixed arities, so a call allocates nothing for the check
 (register-host-methods! "chm"
   (append hashmap-methods
           (let ((put (chm-method "put")) (pia (chm-method "putIfAbsent")) (cv (chm-method "containsValue"))
-                (rm (chm-method "remove")))
-            (list (cons "put" (lambda (self k v) (when (or (jolt-nil? k) (jolt-nil? v)) (chm-npe!)) (put self k v)))
-                  (cons "putIfAbsent" (lambda (self k v) (when (or (jolt-nil? k) (jolt-nil? v)) (chm-npe!)) (pia self k v)))
+                (rm (chm-method "remove")) (rep (chm-method "replace")) (mrg (chm-method "merge"))
+                (cip (chm-method "computeIfPresent")) (cia (chm-method "computeIfAbsent"))
+                (cmp (chm-method "compute")) (pall (chm-method "putAll")))
+            (list (cons "put" (lambda (self k v) (when (or (jolt-nil? k) (jolt-nil? v)) (chm-npe!)) (chm-check-key! self k) (put self k v)))
+                  (cons "putIfAbsent" (lambda (self k v) (when (or (jolt-nil? k) (jolt-nil? v)) (chm-npe!)) (chm-check-key! self k) (pia self k v)))
                   (cons "get" (lambda (self k) (when (jolt-nil? k) (chm-npe!)) (hashtable-ref (hm-tbl self) k jolt-nil)))
                   (cons "containsKey" (lambda (self k) (when (jolt-nil? k) (chm-npe!)) (if (hashtable-contains? (hm-tbl self) k) #t #f)))
                   (cons "containsValue" (lambda (self v) (when (jolt-nil? v) (chm-npe!)) (cv self v)))
                   (cons "remove" (case-lambda
-                                   ((self k) (when (jolt-nil? k) (chm-npe!)) (rm self k))
-                                   ((self k v) (when (jolt-nil? k) (chm-npe!)) (rm self k v))))))))
+                                   ((self k) (when (jolt-nil? k) (chm-npe!)) (chm-check-key! self k) (rm self k))
+                                   ((self k v) (when (jolt-nil? k) (chm-npe!)) (chm-check-key! self k) (rm self k v))))
+                  (cons "replace" (case-lambda
+                                    ((self k v) (chm-check-key! self k) (rep self k v))
+                                    ((self k old v) (chm-check-key! self k)
+                                     (if (and (hashtable-contains? (hm-tbl self) k)
+                                              (jolt=2 old (hashtable-ref (hm-tbl self) k jolt-nil)))
+                                         (begin (hashtable-set! (hm-tbl self) k v) #t)
+                                         #f))))
+                  (cons "merge" (lambda (self k v f) (chm-check-key! self k) (mrg self k v f)))
+                  (cons "computeIfPresent" (lambda (self k f) (chm-check-key! self k) (cip self k f)))
+                  ;; a present key answers its value from the one lookup: the
+                  ;; map holds no nil, so nil is absent
+                  (cons "computeIfAbsent"
+                        (lambda (self k f)
+                          (chm-check-key! self k)
+                          (let ((old (hashtable-ref (hm-tbl self) k jolt-nil)))
+                            (if (jolt-nil? old)
+                                (chm-reserving self k (lambda () (cia self k f)))
+                                old))))
+                  (cons "compute"
+                        (lambda (self k f)
+                          (chm-check-key! self k)
+                          (if (hashtable-contains? (hm-tbl self) k)
+                              (cmp self k f)
+                              (chm-reserving self k (lambda () (cmp self k f))))))
+                  (cons "putAll" (lambda (self m)
+                                   (unless (null? (chm-reserved self))
+                                     (for-each (lambda (e) (chm-check-key! self (jolt-nth e 0)))
+                                               (seq->list (jolt-seq m))))
+                                   (pall self m)))))))
 ;; WeakHashMap: the HashMap shim over a weak table (Chez's generic weak
 ;; hashtables hold their keys weakly under jolt's own hash and equality), so an
 ;; entry whose key nothing else holds goes at the next collection, as on the JDK.
@@ -1594,9 +1695,20 @@
 ;; printed [..]; a LinkedList a List, printed (..); an ArrayDeque only a
 ;; Collection, which keeps the identity equals/hashCode registered above and
 ;; prints as #object over its toString.
+;; the entries =, hash and print walk, which see only keys and values
 (define (hm-entries self)
   (map (lambda (k) (make-map-entry k (hashtable-ref (hm-tbl self) k jolt-nil)))
        (hm-keys-ordered self)))
+;; A Map seqs through its entrySet's iterator on the JVM (RT.seq), so a seq
+;; yields the map's own live entries (HashMap$Node, ConcurrentHashMap$MapEntry
+;; ...), as a LinkedHashMap's already does, not detached MapEntry pairs
+;; (jolt-12zv0). The entrySet views (jutil-concurrent.ss) build them from the
+;; key order, never back through here.
+(define (hm-seq-entries self)
+  (let ((t (jhost-tag self)))
+    (if (or (string=? t "hashmap") (string=? t "jx-identity-hashmap") (string=? t "jx-weak-hashmap"))
+        (hm-node-list self)
+        (jutil-coll-elems (record-method-dispatch self "entrySet" jolt-nil)))))
 (register-jutil-coll! "hashmap" 'map hm-entries)
 (register-jutil-coll! "chm" 'map hm-entries)
 (register-jutil-coll! "jx-weak-hashmap" 'map hm-entries)
@@ -3810,8 +3922,9 @@
              (if (and (jolt-transient? val) (eq? 'set (jolt-transient-kind val))) #t 'pass))
             (else 'pass)))
         'pass)))
-;; (seq a-HashMap) walks its entries, like RT.seqFrom over a java.util.Map.
-(register-seq-arm! hm-hashmap? (lambda (x) (jutil-ff-seq x (seq->list (jolt-seq (hm->pmap x))))))
+;; (seq a-HashMap) walks its entrySet, like RT.seqFrom over a java.util.Map: the
+;; map's own entries in the map's own order (hm-seq-entries)
+(register-seq-arm! hm-hashmap? (lambda (x) (jutil-ff-seq x (hm-seq-entries x))))
 ;; Which shims are Iterable (seqable?) is the java.util registry's answer
 ;; (jutil-colls.ss jhost-seqable-shim?): every shim above registers there.
 ;; a MapEntry does not carry meta on the JVM (AMapEntry); deny IObj/IMeta so the

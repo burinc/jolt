@@ -210,6 +210,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`HashMap` and `HashSet` `remove` is O(1)** (jolt-lfm8p). It rebuilt the
+  map's insertion-order key list, so one removal from a 20k-entry map cost
+  ~112us; it now leaves a stale entry the walk skips, and the list is rebuilt
+  once stale entries outnumber live keys. Iteration order is unchanged.
+- **`ConcurrentHashMap` refuses a recursive update** (jolt-2gc66). A write to
+  the key that `computeIfAbsent` (or `compute` over an absent key) is computing,
+  made from inside its function, is `IllegalStateException` "Recursive update",
+  as on the JDK; reads and other keys go through.
+- **`(seq a-HashMap)` yields the map's own entries** (jolt-12zv0):
+  `HashMap$Node`, `ConcurrentHashMap$MapEntry`, `IdentityHashMap`'s and
+  `WeakHashMap`'s entries, in the map's iteration order, live and printing as
+  `#object[... "k=v"]`, where it yielded detached `MapEntry` pairs in hash
+  order. A `Properties` seqs to `ConcurrentHashMap$MapEntry`, as the JDK's does.
 - **HashSet, LinkedHashSet, TreeSet, the LinkedHashMap and TreeMap views and
   their iterators are fail-fast** (jolt-i6iwq). HashMap, LinkedHashMap and
   TreeMap keep the JDK's modCount, bumped by the same operations (a new key, a
