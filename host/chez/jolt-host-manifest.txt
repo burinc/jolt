@@ -42,6 +42,8 @@ ctx-for-ns
 current-fiber
 current-memory-bytes
 current-source-position
+debug-call-with-break
+debug-frames
 deftype-ctor-class
 delete-file!
 delete-tree!
@@ -205,6 +207,7 @@ pop
 profile-clear!
 profile-defs
 profile-instrument!
+profile-instrument-mode
 profile-instrumenting?
 profile-retired
 profile-sites

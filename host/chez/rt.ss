@@ -1714,6 +1714,44 @@
   (let loop ((i (fx- (vector-length env) 1)))
     (when (fx>? i 0) (vector-set! env i jolt-nil) (loop (fx- i 1)))))
 
+;; jolt.debug (#1464): a debug-compiled scope's locals. Code compiled under
+;; jolt.profile/instrument! :debug binds one of these per scope -- an arity's
+;; params, each let binding, a loop iteration, a catch local -- and keeps the
+;; innermost live across every call it makes (backend_scheme *dbg-scope*), so a
+;; captured continuation's frame holds it as a variable. PARENT is the enclosing
+;; scope's record, #f at a fn's root; NAMES and VALS are a name and its value, or
+;; a vector of each. Opaque, so a frame printed by the inspector stays readable.
+(define-record-type jolt-dbg
+  (fields parent names vals)
+  (nongenerative jolt-dbg-v1) (sealed #t) (opaque #t))
+(define (jolt-dbg-new parent names vals) (make-jolt-dbg parent names vals))
+(define (jolt-dbg-new1 parent name val) (make-jolt-dbg parent name val))
+;; The chain's (name . value) pairs, outermost scope first, so a later pair
+;; shadows an earlier one with its name, as the source does.
+(define (jolt-dbg-locals d)
+  (let gather ((d d) (scopes '()))
+    (if (jolt-dbg? d)
+        (gather (jolt-dbg-parent d) (cons d scopes))
+        (let loop ((ss scopes) (acc '()))
+          (if (null? ss)
+              (reverse acc)
+              (let ((ns (jolt-dbg-names (car ss))) (vs (jolt-dbg-vals (car ss))))
+                (loop (cdr ss)
+                      (if (vector? ns)
+                          (let add ((i 0) (acc acc))
+                            (if (fx=? i (vector-length ns))
+                                acc
+                                (add (fx+ i 1) (cons (cons (vector-ref ns i) (vector-ref vs i)) acc))))
+                          (cons (cons ns vs) acc)))))))))
+(define (jolt-dbg-depth d)
+  (let loop ((d d) (n 0)) (if (jolt-dbg? d) (loop (jolt-dbg-parent d) (fx+ n 1)) n)))
+;; Whether code compiled now is debug-instrumented. The emitter has its own flag
+;; (backend set-debug-locals!); this one is the host's, which the loader reads to
+;; keep such code out of the AOT cache. Set by jolt-profile-instrument!.
+(define jolt-debug-locals-on? #f)
+(define (jolt-debug-locals-set! on?) (set! jolt-debug-locals-on? (and on? #t)))
+(define (jolt-debug-locals-instrumenting?) jolt-debug-locals-on?)
+
 (define (jolt-throw v)
   ;; The throw takes its own capture for the per-thread slots the uncaught-error
   ;; report reads: it rebuilds frames a tail call erased from the throw-time site,

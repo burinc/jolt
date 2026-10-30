@@ -2156,6 +2156,8 @@
           ;; counters, and what an instrumented compile would write to the cache
           ;; is the slower code every later run would load
           (not (sa-profile-instrumenting?))
+          ;; ...and jolt.profile's :debug mode keeps locals that cached code lacks
+          (not (jolt-debug-locals-instrumenting?))
           (or (not (ldr-source-only?)) (ldr-build-aot-cache?))
           (not (ldr-install-file? file))
           ;; no fingerprint = we can't tell this runtime from another one, so

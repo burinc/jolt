@@ -402,11 +402,14 @@
                (not (and (pair? cli-args)
                          (member (car cli-args) '("--aot-worker" "--build-worker")))))
       (load-namespace "jolt.profile")
-      (if (string=? e "sample")
-          (jolt-sample-init-from-env!)
+      (cond
+        ((string=? e "sample") (jolt-sample-init-from-env!))
+        ;; jolt.debug's locals for the whole run; there is nothing to report
+        ((string=? e "debug") (jolt-profile-instrument! (jolt-keyword "debug")))
+        (else
           (let ((at-exit (var-deref "jolt.profile" "report-at-exit")))
             (when (jolt-profile-instrument! #t)
-              (jolt-add-runtime-shutdown-hook (lambda () (jolt-invoke at-exit)))))))))
+              (jolt-add-runtime-shutdown-hook (lambda () (jolt-invoke at-exit))))))))))
 
 (define (jolt-cli-run cli-args prepare-build!)
   ;; Every entry starts in user, as clojure.main's does. The image bakes jolt.main

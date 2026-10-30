@@ -58,6 +58,7 @@ grenadine.tree
 jolt.cli
 jolt.completions
 jolt.continuations
+jolt.debug
 jolt.fibers
 jolt.fs
 jolt.image
