@@ -87,12 +87,17 @@
       [top & below] fs]
   (check "a record method's frame" (str (:fn top)) "debug-fixture/Bomb.boom")
   (check "...its locals" (:locals top) {'this bomb 'n 5 'k 4 'm 9})
-  (check "...its line" (:line top) 51)
+  (check "...its line" (:line top) 66)
   (check "the method's locals stay out of the frames below it"
          (some (fn [fr] (some #(identical? bomb %) (vals (:locals fr)))) below) nil))
 (let [top (first (frames-of #((fx "area") {:kind :sq :w 3})))]
   (check "a defmethod's frame" (str (:fn top)) "debug-fixture/area[:sq]")
   (check "...its locals" (:locals top) '{w 3 a 9}))
+(let [box ((resolve 'debug-fixture/->Box) 3)]
+  (check "an extend-type method's frame"
+         (str (:fn (first (frames-of #((fx "size-of") box))))) "debug-fixture/Box.size-of"))
+(check "an extend-protocol method's frame"
+       (str (:fn (first (frames-of #((fx "size-of") "abc"))))) "debug-fixture/String.size-of")
 
 ;; --- with-break-handler -------------------------------------------------------
 (def seen (atom nil))
@@ -105,6 +110,24 @@
 (check "break hands the throwable" (:msg @seen) "Divide by zero")
 (check "break hands the frames" (:fn (:top @seen)) 'debug-fixture/inner)
 (check "break frames have locals" (:locals (:top @seen)) '{x 2 y 4})
+
+(let [seen (atom nil)]
+  (try (dbg/with-break-handler (fn [_ fs] (reset! seen fs))
+         ((fx "throw-preconstructed") 21))
+       (catch Exception _ nil))
+  (check "break uses the live throw stack, not the construction stack"
+         (:fn (first @seen)) 'debug-fixture/throw-preconstructed)
+  (check "break includes locals bound after construction"
+         (select-keys (:locals (first @seen)) '[x y]) '{x 21 y 42})
+  (check "break omits a constructor frame that already returned"
+         (some #(= 'debug-fixture/make-preconstructed (:fn %)) @seen) nil))
+
+(let [seen (atom nil)]
+  (try (dbg/with-break-handler (fn [_ fs] (reset! seen fs))
+         ((fx "throw-preconstructed-in-loop") 3))
+       (catch Exception _ nil))
+  (check "break uses the throwing loop iteration"
+         (get (:locals (first @seen)) 'i) 3))
 
 (def order (atom []))
 (try (dbg/with-break-handler (fn [_ _] (swap! order conj :handler))

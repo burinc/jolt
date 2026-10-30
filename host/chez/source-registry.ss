@@ -341,11 +341,15 @@
                                  (substring nm (fx+ i 1) (string-length nm)))
                                 (else (find (fx- i 1)))))))
                 (srcreg-frame nm
-                              (if slash
-                                  (vector (substring label 0 slash)
-                                          (substring label (fx+ slash 1) (string-length label))
-                                          (vector-ref entry 0) (or line 0))
-                                  (vector ns (string-append "fn--" n) (vector-ref entry 0) (or line 0)))
+                              (cond
+                                (slash
+                                 (vector (substring label 0 slash)
+                                         (substring label (fx+ slash 1) (string-length label))
+                                         (vector-ref entry 0) (or line 0)))
+                                (label
+                                 (vector ns label (vector-ref entry 0) (or line 0)))
+                                (else
+                                 (vector ns (string-append "fn--" n) (vector-ref entry 0) (or line 0))))
                               line))))))
 
 ;; A frame's jolt-dbg chain: code compiled under jolt.profile's :debug mode keeps
@@ -1619,17 +1623,15 @@
 ;; throwing thread before the stack unwinds, then rethrow. The handler runs in
 ;; the raise's own dynamic context (with-exception-handler, not guard), so the
 ;; frames it is handed are still the live stack and it may block. A throw a
-;; catch inside THUNK handles never gets here. One that a catch clause there does
-;; not match does, after that try has unwound to rethrow it: the frames then come
-;; from the throwable's own capture, which still holds them. A host fault has no
-;; capture of its own, so its frames are read from the handler's continuation,
-;; which sits on top of the raise. A condition that is not serious (a warning)
-;; passes through untouched.
+;; catch inside THUNK handles never gets here. Unlike jolt.debug/frames, which
+;; follows the throwable's construction capture, the break handler always reads
+;; the active raise: a preconstructed throwable must show where it is thrown now,
+;; not a constructor frame that has already returned. The handler's continuation
+;; sits on top of that raise. A condition that is not serious (a warning) passes
+;; through untouched.
 (define (jolt-debug-break! handler c)
   (let* ((v (jolt-unwrap-throw c))
-         (rows (if (jolt-thrown-cont v)
-                   (jolt-debug-throwable-rows v)
-                   (call/cc (lambda (k) (jolt-debug-continuation-rows k (jolt-live-site)))))))
+         (rows (call/cc (lambda (k) (jolt-debug-continuation-rows k (jolt-live-site))))))
     (jolt-invoke handler v (jolt-debug-rows->jolt rows))))
 (define (jolt-debug-call-with-break handler thunk)
   (with-exception-handler
