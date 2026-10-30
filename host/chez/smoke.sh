@@ -1425,6 +1425,34 @@ else
   fails=$((fails + 1))
 fi
 
+# jolt.debug — frames with their locals for a caught throwable, from code loaded
+# under jolt.profile's :debug mode, and the break hook. The file self-checks.
+debug_out="$($jolt run test/chez/debug-test.clj 2>/dev/null)"
+if printf '%s' "$debug_out" | grep -q 'DEBUG-TEST OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: jolt.debug"
+  printf '%s\n' "$debug_out" | grep FAIL | head -5 | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+
+# JOLT_PROFILE=debug compiles the whole run for jolt.debug. As with the counters,
+# a fasl of the fixture an earlier plain run left in the AOT cache must not stand
+# in for the debug compile, or the throwing frame has no locals.
+debug_cache="$(mktemp -d)"
+JOLT_CACHE_DIR="$debug_cache" JOLT_AOT_ASYNC=0 \
+  $jolt -Sdeps "$profile_roots" run test/chez/fixtures/debug_env_main.clj >/dev/null 2>&1
+debug_env_out="$(JOLT_CACHE_DIR="$debug_cache" JOLT_PROFILE=debug \
+  $jolt -Sdeps "$profile_roots" run test/chez/fixtures/debug_env_main.clj 2>&1)"
+rm -rf "$debug_cache"
+if [ "$debug_env_out" = '{x 21, y 42}' ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: JOLT_PROFILE=debug keeps locals"
+  printf '%s\n' "$debug_env_out" | head -8 | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+
 # jolt.profile's sampler — the sample client of the tick scheduler. hot spins three
 # times as long as cold, and the gate compares their shares with each other.
 sample_out="$($jolt run test/chez/sample-test.clj 2>/dev/null)"

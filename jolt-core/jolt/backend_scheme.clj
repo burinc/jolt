@@ -421,6 +421,43 @@
 ;; everywhere else.
 (defn set-source-reg! [on] (reset! (:source-reg? (cur)) (boolean on)))
 (defn- source-reg? [] @(:source-reg? (cur)))
+;; Debug locals (jolt.profile/instrument! :debug, #1464). Code compiled while it
+;; is on keeps every fn's params and let-locals visible to its frame, so
+;; jolt.debug/frames can read them off a throwable's captured continuation. Chez
+;; 10.4 has no continuation attachments, so the locals travel the way the
+;; _ss$/_so$ site slots do: in a variable the frame keeps live across its calls.
+;;
+;; Each scope binds a jolt-dbg chain record (rt.ss) in a fresh _dl$ variable — an
+;; arity's params, each let binding (a catch's local is one), a loop iteration's
+;; bindings — and *dbg-scope* names the innermost one while its body emits. Every tail leaf
+;; is emitted NON-tail and followed by (keep-live _dl$N): the fn's frame then
+;; exists while the leaf runs, so a tail throw keeps the frame it was thrown
+;; from, and _dl$N is live across every call in the scope. recur stays a tail
+;; jump (emit-recur). So debug-compiled code loses tail calls except recur, as on
+;; the JVM. Off, nothing here emits a byte, so the seed mint is unchanged.
+(defn set-debug-locals! [on] (reset! (:debug-locals? (cur)) (boolean on)))
+(defn- debug-locals? [] (boolean (some-> (:debug-locals? (cur)) deref)))
+(def ^:dynamic *dbg-scope* nil)
+(declare chez-str-lit)
+;; The analyzer's own locals (gen-name: _r$<prefix><n>, a raw catch value, a
+;; destructured arg) are not the program's, so no scope record names them, and
+;; neither does a bare (gensym), G__<n>, which is how destructure names the
+;; whole of a destructured arg.
+(defn- dbg-hidden? [nm]
+  (or (str/starts-with? nm "_r$")
+      (and (str/starts-with? nm "G__") (> (count nm) 3)
+           (every? (fn [c] (<= (int \0) (int c) (int \9))) (subs nm 3)))))
+;; A scope record's constructor call: one name and value, or a vector of each.
+(defn- dbg-record1 [parent nm munged]
+  (str "(jolt-dbg-new1 " (or parent "#f") " " (chez-str-lit nm) " " munged ")"))
+(defn- dbg-record [parent nms munged]
+  (let [ps (remove (fn [p] (dbg-hidden? (nth p 0))) (map vector nms munged))]
+    (str "(jolt-dbg-new " (or parent "#f") " (quote #(" (str/join " " (map (fn [p] (chez-str-lit (nth p 0))) ps)) "))"
+         " (vector " (str/join " " (map (fn [p] (nth p 1)) ps)) "))")))
+;; Ops that pass their tail position through to a child the leaf rule then
+;; wraps. A try is NOT one here, unlike tail-transparent-ops: a guard in tail
+;; position erases the enclosing frame, so the whole try is the leaf.
+(def ^:private dbg-structural-ops #{:if :do :let :loop :recur})
 
 ;; --- identifier munging ------------------------------------------------------
 ;; Every Clojure name the emitter writes as a Scheme IDENTIFIER — a local, a
@@ -1172,6 +1209,8 @@
                   ;; (let [fx+ 1] (try 1 (finally nil))) called the local.
                   "+" "=" "not" "eq?" "null?" "procedure?" "string?"
                   "car" "cdr" "cons" "vector" "vector-ref" "vector-set!"
+                  ;; debug locals (*dbg-scope*): every tail leaf and recur
+                  "keep-live"
                   "string-append" "string-length" "string-downcase" "string-upcase"
                   "fx+" "fx-" "fx>" "fx=" "fx=?" "fx>=?" "fl+" "fl-"
                   "flsingle" "flvector-ref" "flvector-set!"
@@ -1277,7 +1316,14 @@
       :else (let [v (fresh-label "_cv$")]
               (str "(let ((" v " " s ")) " st " " v ")")))))
 
+(declare emit-plain)
 (defn emit [node]
+  (if (and *dbg-scope* *tail?* (not (contains? dbg-structural-ops (:op node))))
+    (let [r (fresh-label "_dr$")]
+      (str "(let ((" r " " (binding [*tail?* false] (emit-plain node)) ")) (keep-live "
+           *dbg-scope* ") " r ")"))
+    (emit-plain node)))
+(defn- emit-plain [node]
   (let [s (if (and *tail?* (not (tail-transparent? node)))
             (binding [*tail?* false] (emit* node))
             (emit* node))
@@ -1661,6 +1707,7 @@
 
 ;; letfn lowers to a :let flagged :letrec (mutually-recursive named local fns):
 ;; Scheme `letrec*` binds them so each sees its siblings. A plain let uses let*.
+(declare emit-let-dbg)
 (defn- emit-let [node]
   (let [kw (if (:letrec node) "letrec*" "let*")
         bs (:bindings node)
@@ -1669,24 +1716,54 @@
         ;; flvector from there on (*array-vecs*). let* binds sequentially, so
         ;; each init is emitted under the names bound BEFORE it; letrec* binds
         ;; every name up front.
-        av-body (apply dissoc *array-vecs* names)
-        ;; bindings are non-tail; the body inherits the let's tail position
-        binds (binding [*tail?* false
-                        *letrec-binders* (if (:letrec node)
-                                           (into *letrec-binders*
-                                                 (map #(nth % 0) bs))
-                                           *letrec-binders*)]
-                (cond
-                  (empty? *array-vecs*) (str/join " " (mapv emit-binding bs))
-                  (:letrec node) (binding [*array-vecs* av-body]
-                                   (str/join " " (mapv emit-binding bs)))
-                  :else (loop [bs bs av *array-vecs* acc []]
-                          (if (empty? bs)
-                            (str/join " " acc)
-                            (let [b (first bs)
-                                  s (binding [*array-vecs* av] (emit-binding b))]
-                              (recur (rest bs) (dissoc av (munge-name (nth b 0))) (conj acc s)))))))]
-    (str "(" kw " (" binds ") " (binding [*array-vecs* av-body] (emit (:body node))) ")")))
+        av-body (apply dissoc *array-vecs* names)]
+    (if *dbg-scope*
+      (emit-let-dbg node kw names av-body)
+      ;; bindings are non-tail; the body inherits the let's tail position
+      (let [binds (binding [*tail?* false
+                            *letrec-binders* (if (:letrec node)
+                                               (into *letrec-binders*
+                                                     (map #(nth % 0) bs))
+                                               *letrec-binders*)]
+                    (cond
+                      (empty? *array-vecs*) (str/join " " (mapv emit-binding bs))
+                      (:letrec node) (binding [*array-vecs* av-body]
+                                       (str/join " " (mapv emit-binding bs)))
+                      :else (loop [bs bs av *array-vecs* acc []]
+                              (if (empty? bs)
+                                (str/join " " acc)
+                                (let [b (first bs)
+                                      s (binding [*array-vecs* av] (emit-binding b))]
+                                  (recur (rest bs) (dissoc av (munge-name (nth b 0))) (conj acc s)))))))]
+        (str "(" kw " (" binds ") " (binding [*array-vecs* av-body] (emit (:body node))) ")")))))
+
+;; emit-let under debug locals (*dbg-scope*): each binding is followed by a scope
+;; record holding it, so an init sees the locals bound before it and the body all
+;; of them; a letrec's names get one record after the group. The body is emitted
+;; as a tail region, so its leaves keep the innermost record live.
+(defn- emit-let-dbg [node kw names av-body]
+  (let [bs (:bindings node)]
+    (if (:letrec node)
+      (let [binds (binding [*tail?* false
+                            *letrec-binders* (into *letrec-binders* (map #(nth % 0) bs))
+                            *array-vecs* av-body]
+                    (str/join " " (mapv emit-binding bs)))
+            v (fresh-label "_dl$")
+            rec (dbg-record *dbg-scope* (map #(nth % 0) bs) names)]
+        (str "(" kw " (" binds " (" v " " rec ")) "
+             (binding [*array-vecs* av-body *dbg-scope* v *tail?* true] (emit (:body node))) ")"))
+      (loop [bs bs av *array-vecs* scope *dbg-scope* acc []]
+        (if (empty? bs)
+          (str "(" kw " (" (str/join " " acc) ") "
+               (binding [*array-vecs* av-body *dbg-scope* scope *tail?* true] (emit (:body node))) ")")
+          (let [b (first bs)
+                nm (munge-name (nth b 0))
+                init (binding [*tail?* false *array-vecs* av *dbg-scope* scope] (emit-binding b))]
+            (if (dbg-hidden? (nth b 0))
+              (recur (rest bs) (dissoc av nm) scope (conj acc init))
+              (let [v (fresh-label "_dl$")]
+                (recur (rest bs) (dissoc av nm) v
+                       (conj acc init (str "(" v " " (dbg-record1 scope (nth b 0) nm) ")")))))))))))
 
 (defn- emit-loop [node]
   (let [label (fresh-label "loop")
@@ -1709,9 +1786,16 @@
         seq-bs (str/join " " (map (fn [n i] (str "(" n " " i ")")) names inits))
         rebinds (str/join " " (map (fn [n] (str "(" n " " n ")")) names))
         ;; the loop body inherits the loop's tail position
+        dv (when *dbg-scope* (fresh-label "_dl$"))
         body (binding [*recur-target* label
-                       *array-vecs* (apply dissoc *array-vecs* names)]
-               (emit (:body node)))]
+                       *array-vecs* (apply dissoc *array-vecs* names)
+                       *dbg-scope* (or dv *dbg-scope*)
+                       *tail?* (or (some? dv) *tail?*)]
+               (emit (:body node)))
+        ;; under debug locals each iteration binds a record of the loop's names
+        body (if dv
+               (str "(let ((" dv " " (dbg-record *dbg-scope* (map #(nth % 0) pairs) names) ")) " body ")")
+               body)]
     (str "(let* (" seq-bs ") (let " label " (" rebinds ") " body "))")))
 
 ;; jolt.ffi/__cfn -> a Chez foreign-procedure (jolt-ffi). The C symbol + types are
@@ -2296,8 +2380,15 @@
 (defn- emit-recur [node]
   (when-not *recur-target* (throw (ex-info "emit: recur outside a loop/fn target" {})))
   (let [arg-nodes (:args node)]
-    (ordered-call arg-nodes (mapv emit arg-nodes)
-                  (fn [as] (str "(" *recur-target* " " (str/join " " as) ")")))))
+    (if *dbg-scope*
+      ;; debug locals: the args go to temps and the scope is kept live past them,
+      ;; so a call in an arg sees the locals; the jump itself stays a tail call
+      (let [as (mapv emit arg-nodes)
+            tmps (mapv (fn [_] (fresh-label "_ra$")) as)]
+        (str "(let* (" (str/join " " (map (fn [t a] (str "(" t " " a ")")) tmps as)) ")"
+             " (keep-live " *dbg-scope* ") (" *recur-target* " " (str/join " " tmps) "))"))
+      (ordered-call arg-nodes (mapv emit arg-nodes)
+                    (fn [as] (str "(" *recur-target* " " (str/join " " as) ")"))))))
 
 ;; One arity -> a Scheme lambda param-list + a named-let-wrapped body. The named
 ;; let lets fn-level `recur` rebind this arity's params. A variadic arity takes a
@@ -2357,8 +2448,18 @@
         ;; the body is the fn's tail position — UNLESS a ^double/^long return hint
         ;; wraps it in a coercion below, which puts the body back in non-tail.
         body-tail? (not (or (= ret :double) (= ret :long)))
-        body (binding [*recur-target* label *tail?* body-tail? *array-vecs* av]
+        ;; debug locals: the arity's params are the root of its frame's scope
+        ;; chain, bound inside the named let so a fn-level recur rebinds them; the
+        ;; body is a tail region whatever the return hint (emit's leaf rule)
+        dv (when (debug-locals?) (fresh-label "_dl$"))
+        body (binding [*recur-target* label *tail?* (or (some? dv) body-tail?) *array-vecs* av
+                       *dbg-scope* dv]
                (emit (:body a)))
+        body (if dv
+               (str "(let ((" dv " " (dbg-record nil (concat orig (when-let [r (:rest a)] [r]))
+                                                 (concat params (when restp [restp]))) ")) "
+                    body ")")
+               body)
         body (if (seq avecs)
                (str "(let (" (str/join " " (map (fn [[p v]] (str "(" v " (jolt-array-vec-of " p "))")) avecs))
                     ") " body ")")
@@ -3809,6 +3910,11 @@
       :else
       (invoke))))))
 
+;; A try's body runs in a closure of guard's or dynamic-wind's. Under debug
+;; locals it is a tail region of its own, so its leaves keep the scope live there.
+(defn- emit-try-body [node]
+  (binding [*tail?* (or (some? *dbg-scope*) *tail?*)] (emit (:body node))))
+
 ;; try/catch/finally. throw raises a Chez condition wrapping the jolt value
 ;; (jolt-throw = Scheme `raise` of a &jolt-throw condition); catch lowers to
 ;; `guard`, whose raw binding is unwrapped via jolt-unwrap-throw so the catch var
@@ -3859,14 +3965,18 @@
                      body (str "(guard (" raw " (else (let ((" (munge-name cs) " (jolt-unwrap-throw " raw "))) "
                                (if cl (str "(let ((" cl " (jolt-catch-enter!))) ") "")
                                "(let ((r " (binding [*array-vecs* (dissoc *array-vecs* (munge-name cs) raw)]
-                                            (emit (:catch-body node))) ")) "
+                                            ;; debug locals: the handler body is a tail region.
+                                            ;; cs is the analyzer's; the user's name is a let
+                                            ;; inside, which records itself.
+                                            (binding [*tail?* (or (some? *dbg-scope*) *tail?*)]
+                                              (emit (:catch-body node)))) ")) "
                                (if cl (str "(jolt-catch-leave! " cl ") ") "")
                                "(jolt-catch-complete!) r)"
                                (if cl ")" "")
                                "))) "
-                               (emit (:body node)) ")")]
+                               (emit-try-body node) ")")]
                  body)
-               (emit (:body node)))]
+               (emit-try-body node))]
     (if-let [fin (:finally node)]
       ;; The edges are masked against an interrupt's escape. run-interruptible
       ;; leaves its body by jumping out of a timer interrupt, and Chez checks for

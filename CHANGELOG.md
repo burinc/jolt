@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`jolt.debug`: a throwable's frames with their locals, and a hook before
+  the stack unwinds (#1464).** `(jolt.debug/frames t)` returns the frames
+  `.getStackTrace` reports, innermost first, as maps of `:fn`, `:file`, `:line`
+  and `:locals`, a map of each local's symbol to its value.
+  `(jolt.debug/with-break-handler handler body)` calls `(handler t frames)` on
+  the throwing thread when a throw escapes the body, before anything unwinds,
+  then rethrows; the handler may block. `jolt.profile`'s compile switch gains a
+  debug mode, `(prof/instrument! :debug)` or `JOLT_PROFILE=debug`, and code
+  compiled under it keeps every param and local visible to its frame.
+  Debug-compiled code makes every call but `recur` a real call, as the JVM does,
+  so a tail throw keeps the frame it came from. Other code shows the locals
+  Chez kept live. `(prof/instrument-mode)` says which mode is on. A frame the
+  trace leaves out because no def covers it, a defmethod's body or a record's
+  method, is named as `jolt.profile` names it (`ns/Type.method`,
+  `ns/mm[dispatch]`) when it was compiled under the debug mode.
 - **A built binary's resources read as a jar (#1438).** `io/resource` and
   `ClassLoader.getResource(s)` answer `jar:file:jolt-embedded-resources.jar!/…`
   URLs for files and directories, with the JDK's percent-encoding and, in a

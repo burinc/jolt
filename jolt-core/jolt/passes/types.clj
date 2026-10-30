@@ -100,6 +100,9 @@
    :target (atom :chez)
    :trace-frames? (atom false)
    :source-reg? (atom false)
+   ;; jolt.profile/instrument! :debug — the back end keeps each scope's locals
+   ;; visible to its frame (backend_scheme *dbg-scope*)
+   :debug-locals? (atom false)
    :direct-link-defined (atom #{})
    :direct-link-fns (atom #{})
    ;; the back-end gensym label counter — emit scratch, one per unit and shared by
