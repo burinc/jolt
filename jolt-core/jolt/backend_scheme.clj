@@ -440,8 +440,13 @@
 (def ^:dynamic *dbg-scope* nil)
 (declare chez-str-lit)
 ;; The analyzer's own locals (gen-name: _r$<prefix><n>, a raw catch value, a
-;; destructured arg) are not the program's, so no scope record names them.
-(defn- dbg-hidden? [nm] (str/starts-with? nm "_r$"))
+;; destructured arg) are not the program's, so no scope record names them, and
+;; neither does a bare (gensym), G__<n>, which is how destructure names the
+;; whole of a destructured arg.
+(defn- dbg-hidden? [nm]
+  (or (str/starts-with? nm "_r$")
+      (and (str/starts-with? nm "G__") (> (count nm) 3)
+           (every? (fn [c] (<= (int \0) (int c) (int \9))) (subs nm 3)))))
 ;; A scope record's constructor call: one name and value, or a vector of each.
 (defn- dbg-record1 [parent nm munged]
   (str "(jolt-dbg-new1 " (or parent "#f") " " (chez-str-lit nm) " " munged ")"))

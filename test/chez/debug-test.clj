@@ -80,12 +80,20 @@
 
 (def boom @(resolve 'debug-fixture/boom))
 
-;; a record method's body runs in a frame the trace cannot name; its locals must
-;; not be shown as those of whichever named frame is below it
+;; a record method's and a defmethod's bodies are fn literals no def covers: the
+;; trace drops their frames, and jolt.debug names them as jolt.profile does
 (let [bomb ((resolve 'debug-fixture/->Bomb) 4)
-      fs (frames-of #(boom bomb 5))]
-  (check "an unnamed frame's locals stay out of the frames below it"
-         (some (fn [fr] (some #(identical? bomb %) (vals (:locals fr)))) fs) nil))
+      fs (frames-of #(boom bomb 5))
+      [top & below] fs]
+  (check "a record method's frame" (str (:fn top)) "debug-fixture/Bomb.boom")
+  (check "...its locals" (:locals top) {'this bomb 'n 5 'k 4 'm 9})
+  (check "...its line" (:line top) 51)
+  (check "the method's locals stay out of the frames below it"
+         (some (fn [fr] (some #(identical? bomb %) (vals (:locals fr)))) below) nil))
+(let [top (first (frames-of #((fx "area") {:kind :sq :w 3})))]
+  (check "a defmethod's frame" (str (:fn top)) "debug-fixture/area[:sq]")
+  (check "...its locals" (:locals top) '{w 3 a 9}))
+
 ;; --- with-break-handler -------------------------------------------------------
 (def seen (atom nil))
 (check "break rethrows"

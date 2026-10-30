@@ -49,3 +49,8 @@
 (defrecord Bomb [k]
   Boom
   (boom [this n] (let [m (+ k n)] (/ m 0))))
+
+(defmulti area :kind)
+(defmethod area :sq [{:keys [w]}]
+  (let [a (* w w)]
+    (/ a 0)))

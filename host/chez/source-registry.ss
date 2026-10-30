@@ -316,6 +316,38 @@
                                 (else (hex (fx+ j 1))))))
                 (else #f))))))))
 
+;; The frame of an anonymous fn literal that no def covers, jfn$<ns>/$<n>: a
+;; defmethod's body, a defrecord's or reify's method, a fn made at top level.
+;; The trace cannot name it, so it drops it. When the literal was compiled under
+;; :debug, its form's labels name it as jolt.profile does (ns/Type.method,
+;; ns/mm[dispatch]), else ns/fn--n, at the line the frame is at. #f otherwise.
+(define (jolt-debug-unnamed-frame nm io)
+  (and (string? nm)
+       (fx>? (string-length nm) 4) (string=? (substring nm 0 4) "jfn$")
+       (let* ((pair (srcreg-frame-source-pair io))
+              (entry (and pair (hashtable-ref jolt-debug-sources (car pair) #f))))
+         (and entry
+              (let* ((line (jolt-eval-source-line (car pair) (cdr pair)))
+                     (label (jolt-profile-label-at (vector-ref entry 2) line))
+                     (ns (vector-ref entry 1))
+                     (slash (and label
+                                 (let find ((i 0))
+                                   (cond ((fx=? i (string-length label)) #f)
+                                         ((char=? (string-ref label i) #\/) i)
+                                         (else (find (fx+ i 1)))))))
+                     (n (let find ((i (fx- (string-length nm) 1)))
+                          (cond ((fx<? i 0) "0")
+                                ((char=? (string-ref nm i) #\$)
+                                 (substring nm (fx+ i 1) (string-length nm)))
+                                (else (find (fx- i 1)))))))
+                (srcreg-frame nm
+                              (if slash
+                                  (vector (substring label 0 slash)
+                                          (substring label (fx+ slash 1) (string-length label))
+                                          (vector-ref entry 0) (or line 0))
+                                  (vector ns (string-append "fn--" n) (vector-ref entry 0) (or line 0)))
+                              line))))))
+
 ;; A frame's jolt-dbg chain: code compiled under jolt.profile's :debug mode keeps
 ;; one live in each frame (rt.ss), holding every param and local in scope by its
 ;; Clojure name. The deepest is the innermost scope. #f in other code.
@@ -375,6 +407,13 @@
                                             (else ""))
                                       (srcreg-frame-source-debug io) "\n")
                        (current-error-port)))
+            ;; A jolt.debug walk names a debug-compiled fn literal no def covers
+            ;; (jolt-debug-unnamed-frame); the trace proper leaves it out.
+            (when (and (jolt-debug-locals-sink) (string? nm)
+                       (not (exists (lambda (f) (vector? (srcreg-frame-rec f))) fs))
+                       (not (srcreg-jfn-parts nm)))
+              (let ((f (jolt-debug-unnamed-frame nm io)))
+                (when f (set! fs (list f)))))
             ;; jolt.debug reads the frame's locals while it has the frame: they
             ;; go to the innermost logical frame, where execution is paused.
             ;; An unnamed frame's chain waits for the frame it sits in.
@@ -637,9 +676,22 @@
 ;; INFO is (pos written ns): the form's own {:line :column :file?} position (or
 ;; nil), the form as the user wrote it and the ns it compiles in. Only the
 ;; profiler keeps them (jolt-profile-note-source!).
+;; jolt.debug's own record of a form compiled under :debug: name ->
+;; #(file ns labels), the labels as jolt-profile-form-labels gives them, so a
+;; frame of a fn literal no def covers (a defmethod's body, a record's method)
+;; can be named and placed. Kept and evicted with the marker table, under
+;; jolt-eval-source-mutex.
+(define jolt-debug-sources (make-hashtable string-hash string=?))
+(define (jolt-debug-source-entry pos written ns)
+  (let ((file (let ((v (if (pmap? pos) (jolt-get pos jolt-profile-kw-file jolt-nil) jolt-nil)))
+                (if (string? v) v #f))))
+    (and (string? ns)
+         (vector file ns (car (jolt-profile-form-labels written ns))))))
 (define (jolt-register-eval-marker-table! scm . info)
   (define prof (and (sa-profile-instrumenting?) (= (length info) 3)
                     (apply jolt-profile-source-entry scm info)))
+  (define dbg (and (jolt-debug-locals-instrumenting?) (= (length info) 3)
+                   (apply jolt-debug-source-entry info)))
   (jolt-lock! jolt-eval-source-mutex)
   (let ((name (string-append "jolt-eval-src-"
                              (number->string jolt-eval-source-counter)))
@@ -647,10 +699,13 @@
     (set! jolt-eval-source-counter (+ jolt-eval-source-counter 1))
     (when (fx>=? (hashtable-size jolt-eval-marker-registry) jolt-eval-source-max)
       (let ((old (jolt-eval-queue-pop!)))
-        (when old (hashtable-delete! jolt-eval-marker-registry old))))
+        (when old
+          (hashtable-delete! jolt-eval-marker-registry old)
+          (hashtable-delete! jolt-debug-sources old))))
     (hashtable-set! jolt-eval-marker-registry name table)
     (jolt-eval-queue-push! name)
     (when prof (jolt-profile-note-source! name prof))
+    (when dbg (hashtable-set! jolt-debug-sources name dbg))
     (jolt-unlock! jolt-eval-source-mutex)
     name))
 ;; Resolve an eval-path frame's (name . offset) to a clj line, or #f when the
