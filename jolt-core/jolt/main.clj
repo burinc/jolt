@@ -713,7 +713,10 @@
   always was."
   [form token]
   (jolt.host/interrupt-on-sigint! token)
-  (try (jolt.host/run-interruptible token (fn [] (load-string form)))
+  ;; eval-string, not load-string: load-string binds *ns* for its load, as
+  ;; Compiler.load does, and an entry's (ns foo) must switch the session. The
+  ;; session binds *ns* itself (repl-session), as clojure.main's REPL does.
+  (try (jolt.host/run-interruptible token (fn [] (jolt.host/eval-string form)))
        (finally (jolt.host/interrupt-on-sigint! nil))))
 
 ;; `jolt repl`: resolve the project so deps (git libs) are on the roots and
@@ -732,7 +735,10 @@
   (println (str ";; jolt " (version) " repl — :repl/quit or ^D to exit"))
   ;; *repl* reads true inside the session, and the result/exception history
   ;; vars update per evaluation, like clojure.main's REPL.
+  ;; *ns* too, as clojure.main/with-bindings binds it: an entry's in-ns or ns
+  ;; form switches this binding, and the prompt and the next entry read it.
   (push-thread-bindings {#'clojure.core/*repl* true
+                         #'clojure.core/*ns* *ns*
                          #'clojure.core/*1 nil #'clojure.core/*2 nil
                          #'clojure.core/*3 nil #'clojure.core/*e nil})
   (loop [read-entry (repl-entry-reader)]
