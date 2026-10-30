@@ -3,6 +3,7 @@
 (ns process-test
   (:require [jolt.process :as p :refer [process sh check pipeline]]
             [jolt.fs :as fs]
+            [jolt.scheme :as scm]
             [clojure.string :as str]))
 
 (def failures (atom []))
@@ -356,6 +357,24 @@
                                         " (Thread. (fn [] (println \"HOOK\"))))"
                                         " (println \"MAIN\") (System/exit 0)")]))]
   (check-eq "shutdown hook runs on System/exit" (str/split-lines out) ["MAIN" "HOOK"]))
+
+;; The watcher takes only a signal from its set (HUP, INT, TERM). macOS's sigwait
+;; answers 0 for a kernel EINTR without writing the signal number, so a handled
+;; signal outside the set landing on the watcher thread (a profiling timer's
+;; SIGPROF) read as signal 0, and the watcher ended the process with status 128,
+;; hooks unrun. A buffer holding what the last answer left, or nothing, is the
+;; case: jolt-sigwait-signal's answer decides whether the watcher acts or waits
+;; again. The kernel path can't be staged from here (it needs the signal to land
+;; on that thread), so the decision is checked on its own.
+(let [answer (fn [r n]
+               (scm/eval-string (str "(let ([b (sa-foreign-alloc 4)])"
+                                     " (sa-foreign-set! 'int b 0 " n ")"
+                                     " (let ([s (jolt-sigwait-signal " r " b)]) (sa-foreign-free b) s))")))]
+  (check-eq "sigwait answer: SIGTERM from the set" (answer 0 15) 15)
+  (check-eq "sigwait answer: SIGINT from the set" (answer 0 2) 2)
+  (check-eq "sigwait answer: 0 returned with no signal written (macOS EINTR)" (answer 0 0) false)
+  (check-eq "sigwait answer: a signal outside the set" (answer 0 27) false)
+  (check-eq "sigwait answer: an error number" (answer 4 15) false))
 
 ;; Chez's exit-handler is a THREAD parameter, so a hook registered from a worker
 ;; installs the wrapper on that worker and nowhere else. The main thread has to

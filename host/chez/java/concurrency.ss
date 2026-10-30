@@ -5160,6 +5160,19 @@
   (jolt-with-sigmask jolt-sig-block-how jolt-shutdown-sigset fork))
 (set! jolt-fork-sigmask-guard jolt-fork-with-shutdown-blocked)
 (define c-sigwait (jolt-foreign-proc-blocking "sigwait" '(void* void*) 'int))
+;; What a sigwait answered: its signal when it is one of ours, else #f and the
+;; watcher asks again. The answer is checked, not taken on a zero return: on
+;; macOS, libsystem_pthread's sigwait turns the kernel's EINTR into a return of
+;; 0 WITHOUT writing the signal number (disassembled: a `cmp w19, #4` on errno
+;; selects 0), so a handled signal outside the set that lands on the watcher
+;; thread, a profiling timer's SIGPROF, read as signal 0 and the watcher ended
+;; the process with status 128 and the hooks unrun. The buffer is zeroed before
+;; each wait so a stale number from an earlier answer can't be taken for a new
+;; one, and 0 is no signal.
+(define (jolt-sigwait-signal r sigbuf)
+  (and (eqv? r 0)
+       (let ((sig (sa-foreign-ref 'int sigbuf 0)))
+         (and (memv sig jolt-shutdown-signals) sig))))
 ;; The watcher cannot leave through Chez's (exit): called off the main thread it
 ;; never returns. It has already run the hooks and flushed by then, so _exit is
 ;; the whole of what is left to do.
@@ -5244,7 +5257,8 @@
           (lambda ()
             (let ((sigbuf (sa-foreign-alloc 8)))
               (let loop ()
-                (if (= 0 (c-sigwait jolt-shutdown-sigset sigbuf))
+                (sa-foreign-set! 'int sigbuf 0 0)
+                (if (jolt-sigwait-signal (c-sigwait jolt-shutdown-sigset sigbuf) sigbuf)
                     (let ((sig (sa-foreign-ref 'int sigbuf 0))
                           (target (unbox jolt-sigint-target)))
                       (if (and (= sig 2) target (jolt-sigint-trip! target))
@@ -5259,7 +5273,7 @@
                             ;; 128+signal is the status a shell reports for a process
                             ;; killed by that signal, and what the JVM exits with here.
                             (c-underscore-exit (+ 128 sig)))))
-                    (loop))))))))) ; EINTR — ask again
+                    (loop))))))))) ; an error number, or 0 with no signal of ours — ask again
   jolt-nil)
 
 ;; --- a child must not inherit jolt's signal mask -----------------------------
