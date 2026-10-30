@@ -348,10 +348,12 @@
 ;; The locals for a frame, given the chain PENDING that an unnamed frame just
 ;; inside it left (or #f). A catch body and a try's body run in closures of
 ;; their own (guard's and dynamic-wind's), which no trace names; a chain there
-;; that extends this frame's own is this fn's innermost scope.
+;; that extends this frame's own is this fn's innermost scope. A chain that
+;; does not (an unnamed method body below a caller) is no one's here, and is
+;; dropped rather than shown as the caller's.
 (define (jolt-frame-locals io pending)
   (let ((d (jolt-frame-io-dbg io)))
-    (cond ((and pending (or (not d) (jolt-dbg-within? d pending))) (jolt-dbg-locals pending))
+    (cond ((and pending d (jolt-dbg-within? d pending)) (jolt-dbg-locals pending))
           (d (jolt-dbg-locals d))
           (else (jolt-frame-io-live io)))))
 

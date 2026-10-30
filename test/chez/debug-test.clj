@@ -78,6 +78,14 @@
 (check "uninstrumented frame keeps a live local"
        (get (:locals (frame (frames-of #(plain 1)) 'debug-test/plain)) 'y) 2)
 
+(def boom @(resolve 'debug-fixture/boom))
+
+;; a record method's body runs in a frame the trace cannot name; its locals must
+;; not be shown as those of whichever named frame is below it
+(let [bomb ((resolve 'debug-fixture/->Bomb) 4)
+      fs (frames-of #(boom bomb 5))]
+  (check "an unnamed frame's locals stay out of the frames below it"
+         (some (fn [fr] (some #(identical? bomb %) (vals (:locals fr)))) fs) nil))
 ;; --- with-break-handler -------------------------------------------------------
 (def seen (atom nil))
 (check "break rethrows"

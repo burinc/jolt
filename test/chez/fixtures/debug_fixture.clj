@@ -44,3 +44,8 @@
 (defn with-fn [x]
   (let [f (fn [y] (/ y 0))]
     (f (+ x 1))))
+
+(defprotocol Boom (boom [this n]))
+(defrecord Bomb [k]
+  Boom
+  (boom [this n] (let [m (+ k n)] (/ m 0))))
