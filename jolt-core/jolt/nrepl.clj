@@ -657,10 +657,15 @@
          ;; absolute, so the delete hits the file spit wrote: spit resolves a
          ;; relative path against the started-from directory, delete-file!
          ;; against the process's (bin/jolt cd's to the repo root). nil when the
-         ;; write fails, so stop never deletes a file it did not write.
+         ;; write fails, so stop never deletes a file it did not write; the
+         ;; server still starts, but says the editor won't find it that way.
          port-file (when requested
                      (let [port-file (.getAbsolutePath (io/file requested))]
-                       (try (spit port-file (str port)) port-file (catch :default _ nil))))
+                       (try (spit port-file (str port)) port-file
+                            (catch :default e
+                              (binding [*out* *err*]
+                                (println (str ";; could not write " requested ": " (ex-message e))))
+                              nil))))
          stopped (atom false)]
      (println (str "jolt " (jolt.host/jolt-version) " nREPL server started on port "
                    port " (127.0.0.1)"
