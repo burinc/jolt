@@ -94,9 +94,12 @@
 ;; is String.trim, str-triml / str-trimr / str-trim* back clojure.string.
 ;; U+001C..U+001F (the file/group/record/unit separators) are whitespace to Java but
 ;; carry no Unicode White_Space property, so char-whitespace? alone misses them.
+;; U+0085 (NEL) is the other way round: White_Space has it, and to Java it is a
+;; control character, so Character.isWhitespace says no.
+;; Character/isWhitespace itself answers with this (host-static-methods.ss).
 (define (java-whitespace? c)
   (let ((cp (char->integer c)))
-    (cond ((or (fx=? cp #xA0) (fx=? cp #x2007) (fx=? cp #x202F)) #f)
+    (cond ((or (fx=? cp #xA0) (fx=? cp #x2007) (fx=? cp #x202F) (fx=? cp #x85)) #f)
           ((and (fx>=? cp #x1C) (fx<=? cp #x1F)) #t)
           (else (char-whitespace? c)))))
 
@@ -1035,7 +1038,13 @@
 (define (jolt-str-code-point-at s i) (char->integer (string-ref s (jolt->idx i))))
 (define (jolt-str-last-index-of s needle) (str-last-index-of s (str-needle needle)))
 (define (jolt-str-strip s left? right?) (str-strip s left? right?))
-(define (jolt-str-to-char-array s) (na-char-array s))
+(define (jolt-str-to-char-array s)
+  ;; A ^String-hinted (.toCharArray s) lands here directly. na-char-array reads
+  ;; nil as an empty seq, so a nil s answered an empty array; on the JVM it is the
+  ;; same NullPointerException the unhinted call already raises.
+  (if (jolt-nil? s)
+      (throw-jvm 'NullPointerException "Cannot invoke \"toCharArray\" because the target is null")
+      (na-char-array s)))
 ;; String.intern: one canonical object per content, the JVM's string pool. An
 ;; ephemeron table, because the entry's value is its own key and an ordinary
 ;; weak table would keep every interned string alive through that value. Lookup

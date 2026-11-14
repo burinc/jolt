@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`bencode.core` ships with jolt**, for babashka scripts that name it, since
+  babashka bundles nrepl/bencode. A bare script that speaks nREPL's wire
+  format, such as a small client that drives a running REPL, used to stop at
+  its `require` with "Could not locate bencode/core.jolt". The namespace is
+  nrepl/bencode 1.2.0's own file, in `compatibility/` beside `cheshire.core`,
+  so `read-bencode`, `write-bencode`, `read-netstring` and `write-netstring`
+  behave as the library does. A project that declares `nrepl/bencode` itself
+  still loads its own copy.
+
 ### Fixed
 
 - **Malformed special forms report the reference compiler's error.**
@@ -24,6 +35,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   invalid `--boot`, `:exclude-resources` or `--profile-use`, or a `--target`
   with no target pack, was reported only after the static archives and
   dependency libraries had been compiled.
+- **A `char[]` slice and a null argument to `String.` throw as on the JVM**
+  (#1657). `(String. chars offset count)` now runs String's range check before
+  reading, so a negative offset with a zero count no longer answers `""`, and an
+  overrun is a `StringIndexOutOfBoundsException` with the JDK's message instead
+  of an `ArrayIndexOutOfBoundsException`. `(String. nil)` and `.toCharArray` on a
+  nil `^String` parameter are a `NullPointerException`, where they answered
+  `""` and an empty array.
 
 ## [0.8.27] - 2026-11-12
 
