@@ -274,6 +274,15 @@ uncaught exception exits 1). An `(ns …)` form with `:require`s is fine, and wh
 the directory has a `deps.edn` the script sees the project's paths and
 dependencies, like any other run.
 
+A script ends the way a JVM Clojure program does: once its last form returns,
+the process still waits for live non-daemon threads. After a `future`, `pmap` or
+`send-off` that is the agent pool's 60 s keep-alive, and `clojure.java.shell/sh`
+counts, since it reads the child's output on two futures. After a `send` it waits
+until `shutdown-agents`. The same holds for `jolt run script.clj` and `jolt -e`.
+End the script with `(shutdown-agents)` or `(System/exit 0)` to exit at once. A
+task in `bb.edn` doesn't wait, because its futures run on daemon threads, as in
+babashka.
+
 A built-in command wins a name it shares with a file — `jolt build` is always the
 compiler — which is what `-f` is for. A task loses to one: a file on disk is what
 `jolt greet` means when the project also has a `greet` task. A task loses to a
